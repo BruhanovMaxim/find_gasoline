@@ -1,0 +1,2167 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>НАЙДИ БЕНЗИН</title>
+<style>
+/* ============================================================
+   ТОКЕНЫ / ПАЛИТРА — приборная панель ночного тягача
+   ============================================================ */
+:root{
+  --asphalt:#0B0E12;
+  --panel:rgba(9,12,17,.68);
+  --stroke:rgba(237,230,216,.14);
+  --amber:#FFB020;
+  --amber-dim:#6B4711;
+  --red:#FF3B30;
+  --ok:#57D9A3;
+  --cream:#EDE6D8;
+  --display:"Bahnschrift","DIN Condensed","Oswald","Arial Narrow",system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;background:var(--asphalt);color:var(--cream);
+  font-family:var(--mono);-webkit-font-smoothing:antialiased;touch-action:none}
+/* только холст сцены: общее правило для canvas ломало мини-карту —
+   она выпадала из потока и её панель схлопывалась в точку */
+#scene{display:block;position:fixed;inset:0;width:100%;height:100%}
+
+/* ---------- HUD ---------- */
+#hud{position:fixed;inset:0;pointer-events:none;z-index:10}
+.panel{background:var(--panel);border:1px solid var(--stroke);border-radius:3px;
+  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+
+/* Статистика — левый верх */
+#stats{position:absolute;top:14px;left:14px;padding:10px 12px;display:grid;gap:6px;
+  grid-template-columns:auto auto;font-size:11px;letter-spacing:.06em}
+#stats b{font-family:var(--display);font-size:15px;font-weight:600;letter-spacing:.04em;
+  text-align:right;color:var(--cream)}
+#stats span{color:rgba(237,230,216,.5);text-transform:uppercase}
+#stats b.hot{color:var(--amber)}
+
+/* Таймер работы АЗС */
+#sttimer{position:absolute;top:14px;left:50%;transform:translateX(-50%);
+  width:150px;padding:5px 8px 6px;text-align:center}
+#sttimer b{display:block;font-family:var(--display);font-size:11px;font-weight:600;
+  letter-spacing:.16em;color:rgba(237,230,216,.7);margin-bottom:4px}
+#stfill{display:block;height:3px;border-radius:2px;background:var(--ok);width:100%;
+  transition:width .2s linear}
+#sttimer.soon #stfill{background:var(--red)}
+#sttimer.soon b{color:var(--red)}
+
+/* Колонка топлива — левый низ (сигнатурный элемент) */
+#fuelbox{position:absolute;left:14px;bottom:14px;padding:10px 12px 12px;display:flex;gap:10px;align-items:flex-end}
+#col{display:flex;flex-direction:column-reverse;gap:3px}
+#col i{display:block;width:16px;height:7px;background:var(--amber-dim);border-radius:1px}
+#col i.on{background:var(--amber);box-shadow:0 0 7px rgba(255,176,32,.6)}
+#col i.warn{background:var(--red);box-shadow:0 0 8px rgba(255,59,48,.7)}
+#fuelnum{font-family:var(--display);font-size:40px;font-weight:600;line-height:.86;color:var(--amber)}
+#fuelnum small{font-size:14px;letter-spacing:.08em}
+#fuelpct{font-size:11px;letter-spacing:.12em;color:rgba(237,230,216,.55);margin-top:4px}
+#mode{margin-top:8px;font-size:10px;letter-spacing:.16em;height:12px;color:var(--ok)}
+.low #fuelnum{color:var(--red)}
+
+/* Спидометр — правый низ над картой */
+#speedbox{position:absolute;right:14px;bottom:190px;padding:8px 12px;text-align:right}
+#speed{font-family:var(--display);font-size:34px;font-weight:600;line-height:.9}
+#speedbox span{font-size:10px;letter-spacing:.18em;color:rgba(237,230,216,.45)}
+
+/* Карта с детектором — один круглый прибор.
+   Шкала сигнала и метка направления рисуются в канве по ободку, поверх — пинг и дистанция. */
+#mapbox{position:absolute;right:14px;bottom:14px;padding:5px;border-radius:50%}
+#minimap{display:block;border-radius:50%;width:150px;height:150px}
+#ping{position:absolute;inset:14px;border-radius:50%;border:2px solid var(--ok);
+  opacity:0;transform:scale(.4);pointer-events:none}
+#ping.hit{animation:ping .5s ease-out}
+@keyframes ping{0%{opacity:.85;transform:scale(.35)}100%{opacity:0;transform:scale(1)}}
+#cdist{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);white-space:nowrap;
+  font-family:var(--mono);font-size:9px;font-weight:400;letter-spacing:.1em;
+  padding:2px 6px;border-radius:2px;background:rgba(9,12,17,.82);
+  color:rgba(237,230,216,.75)}
+#mapbox.lock #cdist{color:var(--ok)}
+
+/* Предупреждение / виньетка */
+#vignette{position:fixed;inset:0;pointer-events:none;z-index:9;opacity:0;
+  background:radial-gradient(ellipse at center,transparent 42%,rgba(255,59,48,.55) 100%)}
+#vignette.on{animation:pulse 1s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.15}50%{opacity:.85}}
+#warn{position:absolute;top:52%;left:50%;transform:translate(-50%,-50%);
+  font-family:var(--display);font-size:24px;letter-spacing:.22em;color:var(--red);
+  opacity:0;text-shadow:0 0 18px rgba(255,59,48,.6)}
+#warn.on{animation:pulse 1s ease-in-out infinite}
+
+/* Всплывающие очки */
+#toast{position:absolute;top:38%;left:50%;transform:translateX(-50%);text-align:center;
+  font-family:var(--display);font-size:30px;letter-spacing:.06em;color:var(--ok);opacity:0;
+  text-shadow:0 0 20px rgba(87,217,163,.45)}
+#toast.show{animation:pop 1.3s ease-out}
+@keyframes pop{0%{opacity:0;transform:translateX(-50%) translateY(12px)}
+  18%{opacity:1;transform:translateX(-50%) translateY(0)}
+  75%{opacity:1}100%{opacity:0;transform:translateX(-50%) translateY(-16px)}}
+
+/* ---------- Экраны ---------- */
+.screen{position:fixed;inset:0;z-index:20;display:grid;place-items:center;
+  grid-template-columns:minmax(0,1fr);   /* иначе длинные строки не переносятся, а вылезают за экран */
+  background:radial-gradient(circle at 50% 40%,rgba(20,26,34,.92),rgba(5,7,10,.97));
+  padding:24px;text-align:center;overflow-y:auto}
+.screen>div{max-width:760px}
+.hint-touch{display:none}
+.screen.hidden{display:none}
+.screen h1{font-family:var(--display);font-size:clamp(38px,9vw,76px);font-weight:600;
+  letter-spacing:.12em;line-height:.95}
+.screen h1 em{font-style:normal;color:var(--amber);display:block}
+.screen p{margin-top:14px;font-size:12px;line-height:1.9;letter-spacing:.05em;color:rgba(237,230,216,.6)}
+kbd{font-family:var(--mono);border:1px solid var(--stroke);border-radius:3px;
+  padding:1px 6px;color:var(--cream);background:rgba(237,230,216,.05)}
+button{margin-top:26px;pointer-events:auto;cursor:pointer;font-family:var(--display);
+  font-size:19px;letter-spacing:.16em;padding:13px 40px;color:var(--asphalt);
+  background:var(--amber);border:0;border-radius:3px;transition:transform .12s,box-shadow .12s}
+button:hover,button:focus-visible{transform:translateY(-2px);box-shadow:0 8px 26px rgba(255,176,32,.35);outline:none}
+#over h1{color:var(--red)}
+#result{margin-top:22px;display:grid;grid-template-columns:auto auto;gap:8px 26px;
+  font-size:12px;letter-spacing:.06em;justify-content:center}
+#result b{font-family:var(--display);font-size:22px;font-weight:600;text-align:right;color:var(--amber)}
+#result span{color:rgba(237,230,216,.5);text-transform:uppercase;align-self:center}
+#best{margin-top:16px;font-size:11px;letter-spacing:.14em;color:rgba(237,230,216,.4);
+  line-height:2;white-space:pre-line}
+
+/* Плёнка воды на камере во время дождя */
+#wetlens{position:fixed;inset:0;pointer-events:none;z-index:7;opacity:0;
+  transition:opacity .8s linear;mix-blend-mode:screen;
+  background:
+    repeating-linear-gradient(97deg, rgba(214,236,255,.07) 0 1px, transparent 1px 9px),
+    repeating-linear-gradient(93deg, rgba(214,236,255,.045) 0 2px, transparent 2px 17px),
+    radial-gradient(circle at 22% 18%, rgba(214,236,255,.10), transparent 12%),
+    radial-gradient(circle at 71% 63%, rgba(214,236,255,.08), transparent 9%)}
+
+/* Линии скорости по краям экрана */
+#streaks{position:fixed;inset:-10%;pointer-events:none;z-index:7;opacity:0;
+  background:repeating-conic-gradient(from 0deg at 50% 50%,
+    rgba(255,255,255,.55) 0deg .12deg, transparent .12deg 2.2deg);
+  -webkit-mask-image:radial-gradient(circle at 50% 50%, transparent 34%, #000 88%);
+  mask-image:radial-gradient(circle at 50% 50%, transparent 34%, #000 88%);
+  mix-blend-mode:screen;transition:opacity .18s linear}
+
+/* Солнечные блики (экранный слой, без постобработки) */
+#flare{position:fixed;inset:0;pointer-events:none;z-index:8;overflow:hidden;opacity:0}
+#flare i{position:absolute;display:block;border-radius:50%;transform:translate(-50%,-50%);
+  mix-blend-mode:screen;will-change:left,top}
+#flare .core{width:460px;height:460px;background:radial-gradient(circle,
+  rgba(255,250,232,.95) 0%,rgba(255,222,158,.42) 18%,rgba(255,186,88,.14) 42%,transparent 68%)}
+#flare .g1{width:150px;height:150px;background:radial-gradient(circle,rgba(255,196,110,.30),transparent 68%)}
+#flare .g2{width:78px;height:78px;background:radial-gradient(circle,rgba(150,255,214,.26),transparent 66%)}
+#flare .g3{width:230px;height:230px;background:radial-gradient(circle,rgba(255,168,90,.16),transparent 70%)}
+
+/* Победа */
+#over.win h1 em{color:var(--ok)!important}
+#over.win h1{color:var(--ok)}
+/* Перки */
+.eyebrow{font-size:10px;letter-spacing:.3em;color:var(--amber);margin-bottom:22px}
+#cards{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;max-width:760px}
+.card{pointer-events:auto;cursor:pointer;width:210px;margin:0;padding:20px 18px;text-align:left;
+  color:var(--cream);font-family:var(--mono);font-size:12px;
+  background:rgba(237,230,216,.04);border:1px solid var(--stroke);border-radius:4px;
+  transition:transform .14s,border-color .14s,background .14s}
+.card:hover,.card:focus-visible{transform:translateY(-4px);border-color:var(--amber);
+  background:rgba(255,176,32,.07);outline:none}
+.card b{display:flex;align-items:baseline;gap:8px;font-family:var(--display);font-size:17px;
+  font-weight:600;letter-spacing:.06em;color:var(--amber);margin-bottom:8px}
+.card b i{flex:0 0 auto;white-space:nowrap;margin-left:auto;
+  font-family:var(--mono);font-style:normal;font-size:9px;font-weight:400;
+  letter-spacing:.12em;padding:2px 5px;border-radius:2px;
+  color:rgba(237,230,216,.6);background:rgba(237,230,216,.08)}
+.card span{font-size:11px;line-height:1.7;color:rgba(237,230,216,.65)}
+
+/* Пауза и настройки */
+#opts{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:24px}
+.opt{margin:0;font-size:12px;letter-spacing:.1em;padding:9px 16px;
+  background:transparent;color:var(--cream);border:1px solid var(--stroke)}
+.opt:hover{transform:none;box-shadow:none;border-color:var(--amber);color:var(--amber)}
+
+/* Сенсорное управление */
+#touch{position:fixed;inset:0;z-index:12;pointer-events:none}
+#touch.hidden{display:none}
+#tpad{position:absolute;left:20px;bottom:26px;width:132px;height:132px;border-radius:50%;
+  border:1px solid var(--stroke);background:rgba(9,12,17,.5);pointer-events:auto;
+  display:grid;place-items:center;touch-action:none}
+#tknob{width:52px;height:52px;border-radius:50%;background:rgba(255,176,32,.65);
+  transition:transform .05s linear}
+#tbtns{position:absolute;right:20px;bottom:26px;display:grid;gap:10px;justify-items:end}
+.tbtn{margin:0;pointer-events:auto;touch-action:none;font-size:12px;letter-spacing:.1em;
+  padding:14px 20px;background:rgba(9,12,17,.6);color:var(--cream);border:1px solid var(--stroke)}
+.tbtn.big{padding:26px 30px;font-size:15px;background:rgba(255,176,32,.85);color:var(--asphalt)}
+.tbtn:hover{transform:none;box-shadow:none}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* Узкое окно без тача (десктоп в половину экрана) */
+@media (max-width:560px){
+  #speedbox{bottom:176px}#minimap{width:120px;height:120px}
+  #sttimer{width:128px}
+}
+
+/* ============================================================
+   РАСКЛАДКА ДЛЯ ТЕЛЕФОНА — класс .touch вешается из initTouch()
+   Низ экрана целиком отдан управлению, информация уходит наверх.
+   ============================================================ */
+body.touch #stats{top:8px;left:8px;padding:6px 8px;gap:2px 8px;font-size:8px}
+body.touch #stats b{font-size:11px}
+
+/* Карта с детектором — правый верхний угол, единственный круг на экране */
+body.touch #mapbox{top:8px;right:8px;bottom:auto;padding:4px}
+body.touch #minimap{width:104px;height:104px}
+body.touch #ping{inset:10px}
+body.touch #cdist{bottom:8px;font-size:8px;padding:1px 5px}
+
+/* Таймер АЗС — по центру, под кнопкой паузы */
+body.touch #sttimer{top:40px;width:118px}
+body.touch #sttimer b{font-size:9px;margin-bottom:3px}
+
+/* Топливо — горизонтальная полоса над рулевым падом */
+body.touch #fuelbox{left:10px;bottom:142px;padding:5px 9px 6px;gap:8px;align-items:center}
+body.touch #col{flex-direction:row;gap:2px}
+body.touch #col i{width:5px;height:12px}
+body.touch #fuelnum{font-size:21px}
+body.touch #fuelnum small{font-size:9px}
+body.touch #fuelpct{display:none}
+body.touch #mode{margin-top:2px;font-size:8px;height:9px}
+
+/* Скорость — над кнопками справа */
+body.touch #speedbox{right:10px;bottom:176px;padding:5px 9px;text-align:right}
+body.touch #speed{font-size:24px}
+body.touch #speedbox span{font-size:8px}
+
+/* Руль — левый нижний угол, ничем не перекрыт */
+body.touch #tpad{left:12px;bottom:14px;width:118px;height:118px}
+body.touch #tknob{width:46px;height:46px}
+
+/* Педали — правый нижний угол, раскладка под большой палец */
+body.touch #tbtns{right:12px;bottom:14px;display:block;gap:0}
+body.touch .tbtn{position:absolute;padding:0;display:grid;place-items:center;
+  border-radius:7px;font-size:11px;letter-spacing:.08em}
+body.touch #t-gas{right:0;bottom:0;width:98px;height:100px;font-size:15px}
+body.touch #t-brake{right:0;bottom:108px;width:98px;height:46px}
+body.touch #t-hand{right:106px;bottom:0;width:74px;height:58px}
+body.touch .tbtn:active{background:rgba(255,176,32,.35)}
+body.touch #t-gas:active{background:rgba(255,176,32,1)}
+
+/* Низкий экран (альбомная ориентация): правая колонка не помещается,
+   скорость уезжает вниз по центру — там свободно между рулём и педалями */
+@media (max-height:520px){
+  body.touch #minimap{width:84px;height:84px}
+  body.touch #speedbox{right:auto;left:50%;bottom:16px;transform:translateX(-50%);
+    display:flex;align-items:baseline;gap:5px}
+  body.touch #fuelbox{bottom:140px}
+}
+
+/* Пауза — на телефоне клавиши Esc нет, нужна кнопка */
+body.touch #t-pause{position:absolute;top:8px;left:50%;transform:translateX(-50%);
+  width:34px;height:26px;padding:0;display:grid;place-items:center;border-radius:5px;
+  font-size:11px;letter-spacing:.12em;color:rgba(237,230,216,.7)}
+
+/* Экраны на телефоне: перки в одну колонку, кнопки крупнее */
+body.touch .card{width:100%;max-width:320px;padding:14px 16px}
+body.touch #cards{gap:10px;max-width:340px}
+body.touch .screen p{font-size:11px;line-height:1.7}
+body.touch .hint-kb{display:none}
+body.touch .hint-touch{display:inline}
+body.touch .screen h1{font-size:clamp(32px,11vw,58px)}
+body.touch #opts{gap:8px}
+body.touch .opt{font-size:11px;padding:11px 14px}
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+
+<div id="hud">
+  <div id="stats" class="panel">
+    <span>АЗС</span><b id="s-az">0</b>
+    <span>Счёт</span><b id="s-score" class="hot">0</b>
+    <span>Серия</span><b id="s-combo">×1</b>
+    <span>Время</span><b id="s-time">0:00</b>
+    <span>FPS</span><b id="s-fps">60</b>
+  </div>
+
+  <div id="sttimer" class="panel"><i id="stfill"></i><b id="sttext">АЗС 90</b></div>
+
+  <div id="fuelbox" class="panel">
+    <div id="col"></div>
+    <div>
+      <div id="fuelnum">50<small> Л</small></div>
+      <div id="fuelpct">100%</div>
+      <div id="mode"></div>
+    </div>
+  </div>
+
+  <div id="speedbox" class="panel">
+    <div id="speed">0</div><span>КМ/Ч</span>
+  </div>
+
+  <!-- карта и детектор — один прибор: шкала сигнала по ободку, направление на цель по кромке -->
+  <div id="mapbox" class="panel">
+    <canvas id="minimap" width="180" height="180"></canvas>
+    <i id="ping"></i>
+    <b id="cdist">—</b>
+  </div>
+
+  <div id="warn">НИЗКИЙ УРОВЕНЬ ТОПЛИВА</div>
+  <div id="toast"></div>
+</div>
+
+<!-- сенсорное управление (показывается только на тач-устройствах) -->
+<div id="touch" class="hidden">
+  <button id="t-pause" class="tbtn">II</button>
+  <div id="tpad"><i id="tknob"></i></div>
+  <div id="tbtns">
+    <button id="t-hand" class="tbtn">РУЧНИК</button>
+    <button id="t-brake" class="tbtn">НАЗАД</button>
+    <button id="t-gas" class="tbtn big">ГАЗ</button>
+  </div>
+</div>
+<div id="wetlens"></div>
+<div id="streaks"></div>
+<div id="flare"><i class="core"></i><i class="g1"></i><i class="g2"></i><i class="g3"></i></div>
+<div id="vignette"></div>
+
+<div id="perk" class="screen hidden">
+  <div>
+    <div class="eyebrow">ЗАПРАВЛЕНО · ВЫБЕРИТЕ УЛУЧШЕНИЕ</div>
+    <div id="cards"></div>
+  </div>
+</div>
+
+<div id="pause" class="screen hidden">
+  <div>
+    <h1>ПАУЗА</h1>
+    <div id="opts">
+      <button class="opt" id="o-shadow">ТЕНИ: ВКЛ</button>
+      <button class="opt" id="o-quality">КАЧЕСТВО: ВЫСОКОЕ</button>
+      <button class="opt" id="o-sound">ЗВУК: ВКЛ</button>
+    </div>
+    <button id="resume">ПРОДОЛЖИТЬ</button>
+    <p><span class="hint-kb"><kbd>Esc</kbd> — пауза · <kbd>M</kbd> — звук</span><span class="hint-touch">Кнопка <kbd>II</kbd> сверху — пауза</span></p>
+  </div>
+</div>
+
+<div id="menu" class="screen">
+  <div>
+    <h1>НАЙДИ<em>БЕНЗИН</em></h1>
+    <p>
+      <span class="hint-kb"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> или стрелки — руль и газ · <kbd>Space</kbd> — ручник и занос</span><span class="hint-touch">Круг слева — руль, кнопки справа — газ, назад и ручник.</span><br>
+      Отпустил газ — едешь накатом и почти не тратишь топливо.<br>
+      Детектор показывает силу сигнала. Ближе 150 м он захватывает АЗС и даёт направление.<br>
+      Станция работает по таймеру: не успел — закроется и откроется в другом месте.<br>
+      Удар обнуляет серию и может пробить бак. Дрифт и полный бак приносят очки.<br>
+      Найдите 20 заправок — это победа.
+    </p>
+    <button id="start">ЗАВЕСТИ ДВИГАТЕЛЬ</button>
+  </div>
+</div>
+
+<div id="over" class="screen hidden">
+  <div>
+    <h1 id="over-title">БЕНЗИН<em style="color:var(--red)">ЗАКОНЧИЛСЯ</em></h1>
+    <div id="result">
+      <span>Найдено АЗС</span><b id="r-az">0</b>
+      <span>Счёт</span><b id="r-score">0</b>
+      <span>Продержался</span><b id="r-time">0:00</b>
+      <span>Пройдено</span><b id="r-dist">0 км</b>
+      <span>Макс. серия</span><b id="r-combo">×1</b>
+      <span>Лучший занос</span><b id="r-drift">0</b>
+      <span>Не доехал</span><b id="r-left">0 м</b>
+    </div>
+    <div id="best"></div>
+    <button id="again">ИГРАТЬ СНОВА</button>
+    <p style="margin-top:12px">или нажмите <kbd>R</kbd></p>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.185.1/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   1. КОНСТАНТЫ И УТИЛИТЫ
+   ============================================================ */
+const MAP        = 1152;   // полуразмер карты
+const ROAD_STEP  = 192;    // шаг сетки дорог (кратен размеру ячейки рельефа)
+const ROAD_HALF  = 9;      // полуширина дороги
+const GOAL       = 20;   // сколько АЗС нужно найти для победы
+const TANK_BASE  = 50;   // базовый объём бака (перки его увеличивают)
+const LOCK       = 150;    // радиус захвата детектором
+const ZONE_R     = 130;    // радиус зоны поиска на миникарте
+const VIEW       = 430;    // дальность тумана
+const WHEELBASE  = 3.0;
+
+const clamp = (v,a,b)=>v<a?a:v>b?b:v;
+const lerp  = (a,b,t)=>a+(b-a)*t;
+const smooth= (e0,e1,x)=>{const t=clamp((x-e0)/(e1-e0),0,1);return t*t*(3-2*t);};
+// Детерминированный ГПСЧ — мир одинаков при каждом запуске
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);
+  t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const rnd = mulberry32(20260727);
+
+// Расстояние до ближайшей линии сетки дорог
+const gridDist = v => Math.abs(v - Math.round(v/ROAD_STEP)*ROAD_STEP);
+const roadMask = (x,z)=>1-smooth(ROAD_HALF,ROAD_HALF+30,Math.min(gridDist(x),gridDist(z)));
+const onRoad   = (x,z)=>Math.min(gridDist(x),gridDist(z))<ROAD_HALF+1.5;
+
+// Аналитический рельеф: сумма синусов, выположенная вдоль дорог
+function baseHeight(x,z){
+  const h = 5.6*Math.sin(x*0.0042)*Math.cos(z*0.0037)
+          + 3.1*Math.sin(x*0.0111+1.7)*Math.sin(z*0.0093-0.6)
+          + 1.3*Math.sin((x+z)*0.019);
+  return h*(1-0.975*roadMask(x,z));
+}
+
+/* Полигональная сетка рельефа.
+   Все объекты сажаются НЕ на аналитическую формулу, а на реально отрисованный
+   треугольник — иначе на склонах дороги и деревья тонут или висят в воздухе. */
+const SEG  = 192;                      // сегментов по стороне
+const CELL = (MAP*2)/SEG;              // 12 юнитов; ROAD_STEP кратен CELL
+const H = new Float32Array((SEG+1)*(SEG+1));
+for(let j=0;j<=SEG;j++)
+  for(let i=0;i<=SEG;i++)
+    H[j*(SEG+1)+i] = baseHeight(-MAP+i*CELL, -MAP+j*CELL);
+const hIdx = (i,j)=>H[clamp(j,0,SEG)*(SEG+1)+clamp(i,0,SEG)];
+
+/* Озёра: выкапываем чаши прямо в сетке высот, до того как из неё соберут меш */
+const LAKES=[];
+{
+  for(let a=0; a<60 && LAKES.length<4; a++){
+    const x=(rnd()*2-1)*(MAP-280), z=(rnd()*2-1)*(MAP-280);
+    if(Math.min(gridDist(x),gridDist(z))<95) continue;                 // подальше от дорог
+    if(LAKES.some(l=>(l.x-x)**2+(l.z-z)**2 < 520*520)) continue;
+    const r=70+rnd()*60;
+    let sum=0;
+    for(let k=0;k<12;k++){ const ang=k/12*6.283; sum+=baseHeight(x+Math.cos(ang)*r*1.3, z+Math.sin(ang)*r*1.3); }
+    LAKES.push({x,z,r,base:sum/12});
+  }
+  for(let j=0;j<=SEG;j++) for(let i=0;i<=SEG;i++){
+    const x=-MAP+i*CELL, z=-MAP+j*CELL, k=j*(SEG+1)+i;
+    for(const l of LAKES){
+      const d=Math.hypot(x-l.x,z-l.z);
+      if(d>l.r*1.3) continue;
+      H[k]=lerp(H[k], l.base-8, 1-smooth(l.r*0.2, l.r*1.3, d));
+    }
+  }
+}
+const inLake=(x,z)=>LAKES.some(l=>(l.x-x)**2+(l.z-z)**2 < (l.r*0.98)**2);
+
+// Высота поверхности в точке — интерполяция внутри того же треугольника,
+// которым рельеф разбит в геометрии (квад делится диагональю a-c).
+function heightAt(x,z){
+  const fx=(x+MAP)/CELL, fz=(z+MAP)/CELL;
+  const i=Math.floor(fx), j=Math.floor(fz);
+  const u=fx-i, v=fz-j;
+  const h00=hIdx(i,j), h10=hIdx(i+1,j), h11=hIdx(i+1,j+1), h01=hIdx(i,j+1);
+  return u>=v ? h00+(h10-h00)*u+(h11-h10)*v
+              : h00+(h11-h01)*u+(h01-h00)*v;
+}
+
+/* ============================================================
+   2. ЗВУК — полностью процедурный Web Audio, без файлов
+   ============================================================ */
+const Sfx = {
+  ready:false, ctx:null, noiseBuf:null,
+  init(){
+    if(this.ready) return;
+    const AC = window.AudioContext||window.webkitAudioContext; if(!AC) return;
+    const ctx = this.ctx = new AC();
+    this.master = ctx.createGain(); this.master.gain.value = .5; this.master.connect(ctx.destination);
+
+    // --- двигатель: две пилы + фильтр
+    this.eGain = ctx.createGain(); this.eGain.gain.value = 0;
+    this.eFilt = ctx.createBiquadFilter(); this.eFilt.type='lowpass'; this.eFilt.frequency.value=700;
+    this.eGain.connect(this.eFilt); this.eFilt.connect(this.master);
+    this.o1 = ctx.createOscillator(); this.o1.type='sawtooth';
+    this.o2 = ctx.createOscillator(); this.o2.type='square'; this.o2.detune.value = -14;
+    this.o1.connect(this.eGain); this.o2.connect(this.eGain);
+    this.o1.frequency.value=48; this.o2.frequency.value=24;
+    this.o1.start(); this.o2.start();
+
+    // --- шум колёс/торможения
+    const len = ctx.sampleRate*2, buf = ctx.createBuffer(1,len,ctx.sampleRate), d = buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
+    this.noiseBuf = buf;
+    this.nSrc = ctx.createBufferSource(); this.nSrc.buffer=buf; this.nSrc.loop=true;
+    this.nFilt= ctx.createBiquadFilter(); this.nFilt.type='bandpass'; this.nFilt.frequency.value=900; this.nFilt.Q.value=.8;
+    this.nGain= ctx.createGain(); this.nGain.gain.value=0;
+    this.nSrc.connect(this.nFilt); this.nFilt.connect(this.nGain); this.nGain.connect(this.master);
+    this.nSrc.start();
+
+    // --- шум дождя (отдельный канал)
+    this.rSrc = ctx.createBufferSource(); this.rSrc.buffer=buf; this.rSrc.loop=true;
+    this.rFilt= ctx.createBiquadFilter(); this.rFilt.type='highpass'; this.rFilt.frequency.value=1400;
+    this.rGain= ctx.createGain(); this.rGain.gain.value=0;
+    this.rSrc.connect(this.rFilt); this.rFilt.connect(this.rGain); this.rGain.connect(this.master);
+    this.rSrc.start();
+    this.ready = true;
+  },
+  rain(level){ if(this.ready) this.rGain.gain.setTargetAtTime(level*0.11, this.ctx.currentTime, .5); },
+  // непрерывный звук мотора
+  engine(rpm, load, tyre){
+    if(!this.ready) return;
+    const t = this.ctx.currentTime;
+    const f = 42 + rpm*140;
+    this.o1.frequency.setTargetAtTime(f, t, .06);
+    this.o2.frequency.setTargetAtTime(f*.5, t, .06);
+    this.eFilt.frequency.setTargetAtTime(420 + rpm*2100 + load*600, t, .08);
+    this.eGain.gain.setTargetAtTime(.05 + load*.09 + rpm*.05, t, .08);
+    this.nGain.gain.setTargetAtTime(tyre*.14, t, .1);
+    this.nFilt.frequency.setTargetAtTime(500 + rpm*1600, t, .1);
+  },
+  mute(){ if(this.ready){ this.eGain.gain.setTargetAtTime(0,this.ctx.currentTime,.2);
+                          this.nGain.gain.setTargetAtTime(0,this.ctx.currentTime,.2);} },
+  // короткий тон
+  tone(f0,f1,dur,type='square',vol=.18,delay=0){
+    if(!this.ready) return;
+    const t = this.ctx.currentTime+delay;
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type=type; o.frequency.setValueAtTime(f0,t); o.frequency.exponentialRampToValueAtTime(Math.max(f1,1),t+dur);
+    g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vol,t+.012);
+    g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+    o.connect(g); g.connect(this.master); o.start(t); o.stop(t+dur+.03);
+  },
+  // всплеск шума (торможение, удар)
+  burst(freq,dur,vol=.2){
+    if(!this.ready) return;
+    const t=this.ctx.currentTime;
+    const s=this.ctx.createBufferSource(); s.buffer=this.noiseBuf;
+    const f=this.ctx.createBiquadFilter(); f.type='bandpass'; f.frequency.value=freq; f.Q.value=1.1;
+    const g=this.ctx.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+    s.connect(f); f.connect(g); g.connect(this.master); s.start(t); s.stop(t+dur+.02);
+  },
+  ignition(){ this.burst(320,.45,.22); this.tone(30,120,.7,'sawtooth',.2); },
+  brake(){ this.burst(1500,.28,.16); },
+  hit(){ this.burst(190,.22,.3); this.tone(120,50,.18,'square',.14); },
+  can(){ this.tone(660,1180,.14,'triangle',.2); },
+  ping(strength){ const f=620+strength*620; this.tone(f,f,.035,'sine',.014+strength*0.016); },
+  closed(){ this.tone(500,180,.5,'square',.16); this.tone(380,140,.6,'sawtooth',.1,.1); },
+  leak(){ this.tone(240,90,.5,'sawtooth',.2); this.burst(700,.5,.14); },
+  lowFuel(){ this.tone(880,880,.09,'square',.12); this.tone(880,880,.09,'square',.12,.16); },
+  refuelTick(){ this.tone(1400,1400,.03,'square',.06); },
+  refuelDone(){ [523,659,784,1046].forEach((f,i)=>this.tone(f,f,.16,'triangle',.16,i*.09)); },
+  gameOver(){ this.tone(420,60,1.5,'sawtooth',.24); this.burst(220,1.0,.14); }
+};
+
+/* ============================================================
+   3. СЦЕНА, СВЕТ, НЕБО
+   ============================================================ */
+const canvas   = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true, powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(devicePixelRatio,1.75));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;   // без неё яркие места выжигаются в белое
+renderer.toneMappingExposure = 1.18;
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(58, 1, .5, 1600);
+
+const DAY = { sky:new THREE.Color(0x7FB4E8), hor:new THREE.Color(0xCFE0EA), fog:new THREE.Color(0xC6D8E4),
+              sun:new THREE.Color(0xFFF1D6), amb:new THREE.Color(0x8AA3C0) };
+const DUSK= { sky:new THREE.Color(0x24406F), hor:new THREE.Color(0xFF9B58), fog:new THREE.Color(0xE68B57),
+              sun:new THREE.Color(0xFF8E4A), amb:new THREE.Color(0x8A5F6B) };
+const NIGHT={ sky:new THREE.Color(0x05070F), hor:new THREE.Color(0x141C2B), fog:new THREE.Color(0x101724),
+              sun:new THREE.Color(0x2A3F66), amb:new THREE.Color(0x1B2436) };
+const cSky=new THREE.Color(), cHor=new THREE.Color(), cFog=new THREE.Color();
+// цвет = день→ночь, а на переходе подмешивается закатная палитра
+function palette(out, key, t, dusk){
+  out.copy(DAY[key]).lerp(NIGHT[key], t);
+  if(dusk>0.001) out.lerp(DUSK[key], dusk);
+  return out;
+}
+
+scene.fog = new THREE.Fog(DAY.fog.clone(), 90, VIEW);
+
+// небо-градиент (дешевле кубмапы)
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(1300, 24, 14),
+  new THREE.ShaderMaterial({
+    side:THREE.BackSide, depthWrite:false, fog:false,
+    uniforms:{ top:{value:DAY.sky.clone()}, bottom:{value:DAY.hor.clone()},
+               exposure:{value:renderer.toneMappingExposure} },
+    vertexShader:`varying vec3 vW; void main(){ vW=(modelMatrix*vec4(position,1.)).xyz;
+      gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+    fragmentShader:`uniform vec3 top; uniform vec3 bottom; uniform float exposure; varying vec3 vW;
+      vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
+      void main(){ float h=max(normalize(vW).y,0.0);
+        vec3 c=mix(bottom,top,pow(h,0.55));
+        gl_FragColor=vec4(aces(c*exposure),1.0); }`
+  })
+);
+sky.frustumCulled = false; scene.add(sky);
+
+// звёзды (проявляются ночью)
+const starGeo = new THREE.BufferGeometry();
+{ const p=[]; for(let i=0;i<600;i++){ const th=rnd()*Math.PI*2, ph=Math.acos(rnd()*.85+.05), r=1150;
+    p.push(Math.sin(ph)*Math.cos(th)*r, Math.cos(ph)*r, Math.sin(ph)*Math.sin(th)*r); }
+  starGeo.setAttribute('position', new THREE.Float32BufferAttribute(p,3)); }
+const starMat = new THREE.PointsMaterial({color:0xE8F0FF,size:2.6,sizeAttenuation:false,transparent:true,opacity:0,fog:false});
+const stars = new THREE.Points(starGeo, starMat); stars.frustumCulled=false; scene.add(stars);
+
+const hemi = new THREE.HemisphereLight(0x9FC0E0, 0x4C6136, 1.15); scene.add(hemi);
+const sun  = new THREE.DirectionalLight(0xFFF1D6, 2.1);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048,2048);
+sun.shadow.camera.near = 1; sun.shadow.camera.far = 260;
+sun.shadow.camera.left=-72; sun.shadow.camera.right=72;
+sun.shadow.camera.top=72;  sun.shadow.camera.bottom=-72;
+sun.shadow.bias = -0.0012;
+scene.add(sun); scene.add(sun.target);
+
+/* ============================================================
+   3b. ЗАДНИК: облака и светила — следуют за камерой
+   ============================================================ */
+const backdrop = new THREE.Group(); scene.add(backdrop);
+
+// облачный слой
+const clouds=[];
+{
+  const c=document.createElement('canvas'); c.width=c.height=256;
+  const g=c.getContext('2d');
+  for(let i=0;i<26;i++){
+    const x=20+Math.random()*216, y=60+Math.random()*136, r=18+Math.random()*46;
+    const gr=g.createRadialGradient(x,y,0,x,y,r);
+    gr.addColorStop(0,'rgba(255,255,255,.55)'); gr.addColorStop(1,'rgba(255,255,255,0)');
+    g.fillStyle=gr; g.beginPath(); g.arc(x,y,r,0,6.283); g.fill();
+  }
+  const tex=new THREE.CanvasTexture(c);
+  const mat=new THREE.MeshBasicMaterial({map:tex,transparent:true,opacity:.6,depthWrite:false,fog:false});
+  for(let i=0;i<8;i++){
+    const m=new THREE.Mesh(new THREE.PlaneGeometry(760,420),mat);
+    m.rotation.x=-Math.PI/2; m.rotation.z=Math.random()*6.283;
+    m.position.set((Math.random()*2-1)*900, 210+Math.random()*90, (Math.random()*2-1)*900);
+    m.frustumCulled=false; backdrop.add(m); clouds.push(m);
+  }
+  var cloudMat=mat;
+}
+
+// диски солнца и луны
+const sunDisc = new THREE.Sprite(new THREE.SpriteMaterial({color:0xFFF6DC,transparent:true,
+  blending:THREE.AdditiveBlending,depthWrite:false,fog:false}));
+sunDisc.scale.set(150,150,1); backdrop.add(sunDisc);
+const moonDisc= new THREE.Sprite(new THREE.SpriteMaterial({color:0xCBDCFF,transparent:true,
+  blending:THREE.AdditiveBlending,depthWrite:false,fog:false,opacity:0}));
+moonDisc.scale.set(80,80,1); backdrop.add(moonDisc);
+
+/* ============================================================
+   4. МИР: рельеф, дороги, разметка, объекты (InstancedMesh)
+   ============================================================ */
+const world = new THREE.Group(); scene.add(world);
+// материалы, которые темнеют под дождём
+const wetMats = [];
+const wet = m => { wetMats.push({mat:m, base:m.color.clone()}); return m; };
+const colliders = [];                 // {x,z,r,idx} — idx только у барьеров
+const cellSize = 60, grid = new Map();
+const key = (cx,cz)=>cx+'|'+cz;
+function addCollider(c){
+  colliders.push(c);
+  const k = key(Math.floor(c.x/cellSize), Math.floor(c.z/cellSize));
+  if(!grid.has(k)) grid.set(k,[]);
+  grid.get(k).push(c);
+}
+
+/* --- рельеф: собственная геометрия из сетки H --- */
+{
+  const N=SEG+1, pos=new Float32Array(N*N*3), col=new Float32Array(N*N*3), idx=[];
+  const grass1=new THREE.Color(0x5C8A3C), grass2=new THREE.Color(0x74A24A),
+        dirt=new THREE.Color(0x8A7A4E), c=new THREE.Color();
+  for(let j=0;j<N;j++) for(let i=0;i<N;i++){
+    const k=j*N+i, x=-MAP+i*CELL, z=-MAP+j*CELL, y=H[k];
+    pos[k*3]=x; pos[k*3+1]=y; pos[k*3+2]=z;
+    const n=(Math.sin(x*0.013)*Math.cos(z*0.017)+1)/2;
+    c.copy(grass1).lerp(grass2,n).lerp(dirt, smooth(0,1,roadMask(x,z))*0.6);
+    c.offsetHSL(0,0,(y>4?0.05:0)+(n-.5)*0.03);
+    col[k*3]=c.r; col[k*3+1]=c.g; col[k*3+2]=c.b;
+  }
+  // диагональ a-c — ровно та же, что в heightAt()
+  for(let j=0;j<SEG;j++) for(let i=0;i<SEG;i++){
+    const a=j*N+i, b=a+1, cc=a+N+1, d=a+N;
+    idx.push(a,cc,b, a,d,cc);
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  g.setAttribute('color',    new THREE.BufferAttribute(col,3));
+  g.setIndex(idx); g.computeVertexNormals();
+  const ground=new THREE.Mesh(g, wet(new THREE.MeshLambertMaterial({vertexColors:true, flatShading:true})));
+  ground.receiveShadow=true;
+  world.add(ground);
+}
+
+/* --- вода в озёрах --- */
+const waterMat=new THREE.MeshBasicMaterial({color:0x2E6B7A,transparent:true,opacity:.78,depthWrite:false});
+const WATER_DEEP=new THREE.Color(0x12414F);
+LAKES.forEach(l=>{
+  const m=new THREE.Mesh(new THREE.CircleGeometry(l.r*1.04,30), waterMat);
+  m.rotation.x=-Math.PI/2; m.position.set(l.x, l.base-1.2, l.z);
+  world.add(m);
+});
+
+/* --- дороги: асфальт + гравийная кромка + краевая разметка --- */
+{
+  const STEPS=SEG/2, step=CELL*2;
+  // универсальный построитель ленты между двумя боковыми смещениями
+  function ribbon(cols, yOff){
+    const positions=[], indices=[]; let v=0;
+    const line=(axis,fixed)=>{
+      const base=v;
+      for(let i=0;i<=STEPS;i++){
+        const t=-MAP+i*step;
+        for(const s of cols){
+          const x = axis==='x' ? fixed+s : t;
+          const z = axis==='x' ? t : fixed+s;
+          positions.push(x, heightAt(x,z)+yOff, z); v++;
+        }
+      }
+      for(let i=0;i<STEPS;i++) for(let c=0;c<cols.length-1;c++){
+        const a=base+i*cols.length+c, b=a+1, cc=a+cols.length, d=cc+1;
+        indices.push(a,cc,b, b,cc,d);
+      }
+    };
+    for(let f=-MAP; f<=MAP; f+=ROAD_STEP){ line('x',f); line('z',f); }
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+    g.setIndex(indices); g.computeVertexNormals();
+    return g;
+  }
+  const mat=(c,extra={})=>wet(new THREE.MeshLambertMaterial(Object.assign({
+    color:c, side:THREE.DoubleSide, flatShading:true,
+    polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2}, extra)));
+
+  const gravelMat=mat(0x8A7B5C);
+  [[-ROAD_HALF-3.2,-ROAD_HALF],[ROAD_HALF,ROAD_HALF+3.2]].forEach(cols=>{
+    const m=new THREE.Mesh(ribbon(cols,0.10), gravelMat);
+    m.receiveShadow=true; world.add(m);
+  });
+
+  const road=new THREE.Mesh(ribbon([-ROAD_HALF,0,ROAD_HALF],0.14), mat(0x535353));
+  road.receiveShadow=true; world.add(road);
+
+  const lineMat=mat(0xCFCABA);
+  [[-ROAD_HALF+0.7,-ROAD_HALF+1.2],[ROAD_HALF-1.2,ROAD_HALF-0.7]].forEach(cols=>{
+    world.add(new THREE.Mesh(ribbon(cols,0.20), lineMat));
+  });
+}
+
+/* --- разметка --- */
+{
+  const dash=new THREE.BoxGeometry(0.42,0.05,3.2);
+  const mat=new THREE.MeshBasicMaterial({color:0xD9D4C4});
+  const items=[];
+  for(let f=-MAP; f<=MAP; f+=ROAD_STEP){
+    for(let t=-MAP; t<MAP; t+=22){
+      if(gridDist(t)<ROAD_HALF+5) continue;          // не рисуем на перекрёстках
+      items.push([f,t,0], [t,f,Math.PI/2]);
+    }
+  }
+  const m=new THREE.InstancedMesh(dash,mat,items.length), d=new THREE.Object3D();
+  items.forEach(([x,z,ry],i)=>{ d.position.set(x,heightAt(x,z)+0.26,z); d.rotation.set(0,ry,0);
+    d.updateMatrix(); m.setMatrixAt(i,d.matrix); });
+  m.instanceMatrix.needsUpdate=true; world.add(m);
+}
+
+/* --- вспомогательная фабрика инстансов --- */
+function instanced(geo, mat, list, shadow=true){
+  const m=new THREE.InstancedMesh(geo, mat, Math.max(list.length,1));
+  const d=new THREE.Object3D();
+  list.forEach((o,i)=>{ d.position.set(o.x,o.y,o.z); d.rotation.set(o.rx||0,o.ry||0,o.rz||0);
+    d.scale.set(o.s||1,o.sy||o.s||1,o.s||1); d.updateMatrix(); m.setMatrixAt(i,d.matrix); });
+  m.count=list.length; m.instanceMatrix.needsUpdate=true;
+  m.castShadow=shadow; m.receiveShadow=shadow; world.add(m); return m;
+}
+
+/* --- деревья, камни, дома, кусты, фонари, знаки --- */
+const lampHeads = [];  // для ночной подсветки
+const spots = [];      // контактные тени-пятна под объектами
+let lampMat = null;    // материал плафонов — светится ночью
+const LINES = [];      // координаты линий дорог
+for(let f=-MAP; f<=MAP; f+=ROAD_STEP) LINES.push(f);
+const anyLine = ()=>LINES[Math.floor(rnd()*LINES.length)];
+// объект стоит на проезжей части, если он ближе margin к любой линии сетки
+const onPavement = (x,z,margin)=>Math.min(gridDist(x),gridDist(z))<margin;
+// мягкая круглая текстура — годится и для теней-пятен, и для ореолов света
+function radialTexture(inner, outer, power){
+  const c=document.createElement('canvas'); c.width=c.height=128;
+  const g=c.getContext('2d');
+  const grad=g.createRadialGradient(64,64,0,64,64,64);
+  for(let i=0;i<=8;i++){
+    const t=i/8;
+    grad.addColorStop(t, `rgba(255,255,255,${(inner*Math.pow(1-t,power)+outer).toFixed(3)})`);
+  }
+  g.fillStyle=grad; g.fillRect(0,0,128,128);
+  return new THREE.CanvasTexture(c);
+}
+const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
+{
+  const trunks=[], crowns=[], rocks=[], walls=[], roofs=[], bushes=[],
+        poles=[], heads=[], signPoles=[], signPlates=[];
+
+  // деревья (вне дорог)
+  for(let i=0;i<2600;i++){
+    const x=(rnd()*2-1)*MAP, z=(rnd()*2-1)*MAP;
+    if(Math.min(gridDist(x),gridDist(z))<22) continue;
+    if(inLake(x,z)) continue;
+    const y=heightAt(x,z), s=.8+rnd()*.9, ry=rnd()*6.28;
+    trunks.push({x,y:y+1.5*s,z,s:s*.55,sy:s*3,ry});
+    crowns.push({x,y:y+4.2*s,z,s:s*2.6,ry});
+    spots.push({x,y:y+0.07,z,s:s*4.4,rx:-Math.PI/2});
+    addCollider({x,z,r:1.6*s});
+  }
+  // камни
+  for(let i=0;i<420;i++){
+    const x=(rnd()*2-1)*MAP, z=(rnd()*2-1)*MAP;
+    if(onPavement(x,z,ROAD_HALF+9)||inLake(x,z)) continue;
+    const s=.7+rnd()*1.6;
+    rocks.push({x,y:heightAt(x,z)+s*.45,z,s,ry:rnd()*6.28,rx:rnd()*.6});
+    spots.push({x,y:heightAt(x,z)+0.07,z,s:s*2.2,rx:-Math.PI/2});
+    addCollider({x,z,r:s*.9});
+  }
+  // дома: деревни вокруг перекрёстков + одиночные хутора вдоль дорог
+  const house=(x,z,vertical)=>{
+    if(Math.abs(x)>MAP-30||Math.abs(z)>MAP-30) return;
+    if(onPavement(x,z,ROAD_HALF+7)||inLake(x,z)) return;
+    const y=heightAt(x,z), w=6+rnd()*5, ry=vertical?0:Math.PI/2;
+    walls.push({x,y:y+2.2,z,s:w/6,sy:1,ry});
+    roofs.push({x,y:y+4.35+1.3,z,s:w/6*1.15,sy:1,ry:ry+Math.PI/4});
+    spots.push({x,y:y+0.07,z,s:w*1.7,rx:-Math.PI/2});
+    addCollider({x,z,r:w*.62});
+  };
+  for(let v=0;v<26;v++){                       // деревни
+    const cx=anyLine(), cz=anyLine();
+    const n=5+Math.floor(rnd()*6);
+    for(let k=0;k<n;k++){
+      const vertical=rnd()<.5;
+      const along=(rnd()*2-1)*105;
+      const off=(ROAD_HALF+12+rnd()*16)*(rnd()<.5?-1:1);
+      house(vertical?cx+off:cx+along, vertical?cz+along:cz+off, vertical);
+    }
+  }
+  for(let i=0;i<110;i++){                      // хутора
+    const vertical=rnd()<.5;
+    const line=anyLine(), along=(rnd()*2-1)*MAP;
+    const off=(ROAD_HALF+13+rnd()*20)*(rnd()<.5?-1:1);
+    house(vertical?line+off:along, vertical?along:line+off, vertical);
+  }
+  // кусты кучками в полях (на дорогу и обочину не лезут)
+  for(let i=0;i<130;i++){
+    const cx=(rnd()*2-1)*(MAP-70), cz=(rnd()*2-1)*(MAP-70);
+    const n=4+Math.floor(rnd()*9);
+    for(let k=0;k<n;k++){
+      const x=cx+(rnd()*2-1)*15, z=cz+(rnd()*2-1)*15;
+      if(Math.abs(x)>MAP||Math.abs(z)>MAP) continue;
+      if(onPavement(x,z,ROAD_HALF+7)||inLake(x,z)) continue;
+      const s=0.85+rnd()*1.15;
+      bushes.push({x,y:heightAt(x,z)+s*0.46,z,s,sy:s*0.7,ry:rnd()*6.28});
+      spots.push({x,y:heightAt(x,z)+0.07,z,s:s*2.1,rx:-Math.PI/2});
+    }
+  }
+  // фонари вдоль дорог (не на перекрёстках)
+  for(const f of LINES){
+    for(let t=-MAP+40; t<MAP; t+=90){
+      for(const [x,z] of [[f+ROAD_HALF+3.6,t],[t,f+ROAD_HALF+3.6]]){
+        if(Math.abs(x)>MAP||Math.abs(z)>MAP) continue;
+        if(onPavement(x,z,ROAD_HALF+3)) continue;
+        const y=heightAt(x,z);
+        poles.push({x,y:y+3.2,z,s:1});
+        heads.push({x,y:y+6.5,z,s:1});
+        lampHeads.push({x,y:y+6.5,z});
+        addCollider({x,z,r:.7});
+      }
+    }
+  }
+  // дорожные знаки (на обочине, не на полотне)
+  for(let i=0;i<120;i++){
+    const vertical=rnd()<.5;
+    const fx=anyLine()+(ROAD_HALF+3.4)*(rnd()<.5?-1:1);
+    const along=(rnd()*2-1)*(MAP-60);
+    const x=vertical?fx:along, z=vertical?along:fx;
+    if(onPavement(x,z,ROAD_HALF+2.8)) continue;
+    const y=heightAt(x,z);
+    signPoles.push({x,y:y+1.3,z,s:1});
+    signPlates.push({x,y:y+2.7,z,s:1,ry:vertical?0:Math.PI/2});
+  }
+
+  const M = (c,e=0)=>new THREE.MeshLambertMaterial({color:c,flatShading:true,emissive:e});
+  // вертикальный градиент по вершинам: низ темнее — объём без лишних полигонов
+  function shaded(geo, dark){
+    geo.computeBoundingBox();
+    const bb=geo.boundingBox, pos=geo.attributes.position, col=[];
+    const c=new THREE.Color(), a=new THREE.Color(dark), b=new THREE.Color(0xFFFFFF);
+    for(let i=0;i<pos.count;i++){
+      const t=(pos.getY(i)-bb.min.y)/Math.max(bb.max.y-bb.min.y,0.001);
+      c.copy(a).lerp(b,t*t);
+      col.push(c.r,c.g,c.b);
+    }
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(col,3));
+    return geo;
+  }
+  const Mv=(c)=>new THREE.MeshLambertMaterial({color:c,flatShading:true,vertexColors:true});
+
+  instanced(new THREE.CylinderGeometry(.5,.65,1,5), M(0x5A4327), trunks);
+  instanced(shaded(new THREE.IcosahedronGeometry(1,0),0x2E5626), Mv(0x4B8A3C), crowns);
+  instanced(new THREE.DodecahedronGeometry(1,0),     M(0x8C8A85), rocks);
+  instanced(new THREE.BoxGeometry(6,4.4,7),          M(0xC7B49A), walls);
+  instanced(new THREE.ConeGeometry(5.2,2.6,4),       M(0x8E4A3C), roofs);
+  const bushMesh=instanced(shaded(new THREE.IcosahedronGeometry(1,0),0x2A4520), Mv(0x3E6B34), bushes);
+  {
+    const bc=new THREE.Color();
+    for(let i=0;i<bushes.length;i++){
+      bc.setHSL(0.26+rnd()*0.06, 0.34+rnd()*0.16, 0.20+rnd()*0.12);
+      bushMesh.setColorAt(i,bc);
+    }
+    if(bushMesh.instanceColor) bushMesh.instanceColor.needsUpdate=true;
+  }
+  instanced(new THREE.CylinderGeometry(.16,.2,6.4,6),M(0x4A5158), poles);
+  lampMat = M(0xFFE9B0,0x000000);
+  instanced(new THREE.BoxGeometry(1.2,.35,.6),       lampMat, heads, false);
+  instanced(new THREE.CylinderGeometry(.09,.09,2.6,5),M(0x9AA0A6), signPoles,false);
+  instanced(new THREE.BoxGeometry(1.5,1.5,.1),       M(0xE2E6E9), signPlates,false);
+}
+
+/* --- контактные тени под объектами (одна отрисовка на всё) --- */
+instanced(new THREE.PlaneGeometry(1,1),
+  new THREE.MeshBasicMaterial({map:spotTex,color:0x0C1409,transparent:true,opacity:.42,
+    depthWrite:false,polygonOffset:true,polygonOffsetFactor:-3,polygonOffsetUnits:-3}),
+  spots, false);
+
+/* --- ореолы фонарей: одна точечная система, всегда лицом к камере --- */
+const lampGlow = (()=>{
+  const g=new THREE.BufferGeometry(), p=new Float32Array(lampHeads.length*3);
+  lampHeads.forEach((l,i)=>{ p[i*3]=l.x; p[i*3+1]=l.y; p[i*3+2]=l.z; });
+  g.setAttribute('position', new THREE.BufferAttribute(p,3));
+  const m=new THREE.Points(g, new THREE.PointsMaterial({map:haloTex,color:0xFFD9A0,size:11,
+    sizeAttenuation:true,transparent:true,opacity:0,depthWrite:false,
+    blending:THREE.AdditiveBlending,fog:true}));
+  scene.add(m); return m;
+})();
+// круглая текстура готова — отдаём её светилам
+sunDisc.material.map=haloTex;  sunDisc.material.needsUpdate=true;
+moonDisc.material.map=haloTex; moonDisc.material.needsUpdate=true;
+
+/* --- препятствия (появляются с ростом сложности; на полотно не ставятся) --- */
+const BARRIER_MAX = 130;
+const barrierList = [];
+for(let i=0;i<BARRIER_MAX;i++){
+  let x=0,z=0,ry=0,ok=false;
+  for(let a=0;a<30;a++){
+    const vertical=rnd()<.5;
+    // вдоль обочины: 16…34 м от оси дороги — мешают тем, кто срезает
+    const off=(ROAD_HALF+7+rnd()*18)*(rnd()<.5?-1:1);
+    const line=anyLine()+off;
+    const along=(rnd()*2-1)*(MAP-80);
+    x=vertical?line:along; z=vertical?along:line;
+    if(onPavement(x,z,ROAD_HALF+6)) continue;      // ни на дороге, ни на перекрёстке
+    ry=vertical?Math.PI/2:0;                        // поперёк съезда
+    ok=true; break;
+  }
+  if(!ok) continue;
+  barrierList.push({x,y:heightAt(x,z)+.6,z,ry});
+  addCollider({x,z,r:1.9,idx:barrierList.length-1});
+}
+const barriers = instanced(new THREE.BoxGeometry(3.4,1.2,.5),
+  new THREE.MeshLambertMaterial({color:0xD94A32,flatShading:true}), barrierList);
+barriers.count = 0;
+
+/* ============================================================
+   5. АВТОМОБИЛЬ
+   ============================================================ */
+const car = new THREE.Group(); car.rotation.order='YXZ'; scene.add(car);
+const wheels=[], headGlow=[];
+{
+  const paint=new THREE.MeshLambertMaterial({color:0xE0A423,flatShading:true});
+  const dark =new THREE.MeshLambertMaterial({color:0x23272C,flatShading:true});
+  const glass=new THREE.MeshLambertMaterial({color:0x2E4756,flatShading:true});
+
+  const body=new THREE.Mesh(new THREE.BoxGeometry(2.0,.7,4.3),paint); body.position.y=.85;
+  const cab =new THREE.Mesh(new THREE.BoxGeometry(1.72,.62,2.0),glass); cab.position.set(0,1.42,-.15);
+  const nose=new THREE.Mesh(new THREE.BoxGeometry(1.9,.34,.9),paint); nose.position.set(0,.68,2.1);
+  [body,cab,nose].forEach(m=>{m.castShadow=true;car.add(m);});
+
+  const wg=new THREE.CylinderGeometry(.45,.45,.34,10); wg.rotateZ(Math.PI/2);
+  [[-.95,-1.45],[.95,-1.45],[-.95,1.45],[.95,1.45]].forEach(([x,z],i)=>{
+    const w=new THREE.Mesh(wg,dark); w.position.set(x,.48,z); w.rotation.order='YXZ';
+    w.castShadow=true; w.userData.front = i>1; car.add(w); wheels.push(w);
+  });
+
+  // фары и стопы
+  const hl=new THREE.MeshBasicMaterial({color:0xFFF0C0});
+  const tl=new THREE.MeshBasicMaterial({color:0x8E1B12});
+  [[-.62,2.5],[.62,2.5]].forEach(([x,z])=>{
+    const m=new THREE.Mesh(new THREE.BoxGeometry(.42,.2,.12),hl); m.position.set(x,.8,z); car.add(m);
+  });
+  const tail=new THREE.Mesh(new THREE.BoxGeometry(1.7,.16,.1),tl); tail.position.set(0,.85,-2.2); car.add(tail);
+  car.userData.tail=tail; car.userData.tailMat=tl;
+
+  // ореолы фар — дают bloom-эффект без постобработки
+  [-.62,.62].forEach(x=>{
+    const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:haloTex,color:0xFFE6B4,
+      transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,opacity:0,fog:true}));
+    sp.scale.set(5,5,1); sp.position.set(x,.82,2.55); car.add(sp); headGlow.push(sp);
+  });
+
+  // ближний свет (включается ночью)
+  const beam=(x)=>{
+    const l=new THREE.SpotLight(0xFFE9C0, 0, 95, 0.44, .45, 1.1);
+    l.position.set(x,.85,2.4); l.target.position.set(x,-1.2,30);
+    car.add(l); car.add(l.target); return l;
+  };
+  car.userData.beams=[beam(-.62),beam(.62)];
+}
+
+/* ============================================================
+   6. АЗС, КАНИСТРЫ, ЭФФЕКТЫ
+   ============================================================ */
+const station = new THREE.Group(); scene.add(station);
+let stationPos = new THREE.Vector3();
+const stationGlow = new THREE.Sprite(new THREE.SpriteMaterial({map:haloTex,color:0x8CFFCE,
+  transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,opacity:.5,fog:true}));
+stationGlow.scale.set(30,30,1); stationGlow.position.y=19.4; station.add(stationGlow);
+{
+  const steel=new THREE.MeshLambertMaterial({color:0xD8DDE2,flatShading:true});
+  const red  =new THREE.MeshLambertMaterial({color:0xE0392B,flatShading:true,emissive:0x360a06});
+  const glow =new THREE.MeshBasicMaterial({color:0x7CFFC4});
+
+  const canopy=new THREE.Mesh(new THREE.BoxGeometry(14,.7,10),steel); canopy.position.y=6.2; canopy.castShadow=true;
+  station.add(canopy);
+  [[-6,-4],[6,-4],[-6,4],[6,4]].forEach(([x,z])=>{
+    const p=new THREE.Mesh(new THREE.CylinderGeometry(.35,.35,6,6),steel);
+    p.position.set(x,3,z); p.castShadow=true; station.add(p);
+  });
+  const pump=new THREE.Mesh(new THREE.BoxGeometry(1.2,2.2,2.6),red); pump.position.y=1.1; pump.castShadow=true; station.add(pump);
+
+  // высокий указатель + вывеска
+  const mast=new THREE.Mesh(new THREE.CylinderGeometry(.28,.28,17,6),steel); mast.position.set(9,8.5,0); station.add(mast);
+  const board=new THREE.Mesh(new THREE.BoxGeometry(.3,3.4,6),
+    new THREE.MeshBasicMaterial({color:0x18E08A})); board.position.set(9,16,0); station.add(board);
+
+  // маркер-луч (виден сквозь туман — главный ориентир) и пульсирующее кольцо
+  const beam=new THREE.Mesh(new THREE.CylinderGeometry(2.2,7,170,12,1,true),
+    new THREE.MeshBasicMaterial({color:0x38FFB0,transparent:true,opacity:.13,
+      side:THREE.DoubleSide,depthWrite:false,fog:false}));
+  beam.position.y=85; station.add(beam); station.userData.beam=beam;
+
+  const ring=new THREE.Mesh(new THREE.TorusGeometry(4.4,.22,6,28),glow);
+  ring.rotation.x=Math.PI/2; ring.position.y=.4; station.add(ring); station.userData.ring=ring;
+
+  const orb=new THREE.Mesh(new THREE.IcosahedronGeometry(1.1,0),glow); orb.position.y=19.4; station.add(orb);
+  station.userData.orb=orb;
+
+  const lamp=new THREE.PointLight(0x7CFFC4, 60, 90, 1.4); lamp.position.set(0,7,0);
+  station.add(lamp); station.userData.lamp=lamp;
+}
+
+// канистры
+const cans=[];
+{
+  const g=new THREE.BoxGeometry(.8,1.1,.55);
+  const m=new THREE.MeshLambertMaterial({color:0xF2C230,flatShading:true,emissive:0x3a2a00});
+  for(let i=0;i<6;i++){
+    const c=new THREE.Mesh(g,m); c.castShadow=true; c.visible=false; scene.add(c);
+    const halo=new THREE.Mesh(new THREE.TorusGeometry(1.1,.07,5,18),
+      new THREE.MeshBasicMaterial({color:0xFFD24A,transparent:true,opacity:.7}));
+    halo.rotation.x=Math.PI/2; c.add(halo);
+    cans.push({mesh:c,taken:true});
+  }
+}
+
+// следы шин (кольцевой буфер инстансов)
+const TRACK_N=520;
+const tracks=new THREE.InstancedMesh(new THREE.PlaneGeometry(.5,1.6),
+  new THREE.MeshBasicMaterial({color:0x1D1A16,transparent:true,opacity:.32,depthWrite:false}), TRACK_N);
+tracks.frustumCulled=false; scene.add(tracks);
+let trackI=0; const tDummy=new THREE.Object3D(); tDummy.rotation.order='YXZ';
+{ // спрятать все следы за карту
+  tDummy.position.set(0,-500,0); tDummy.updateMatrix();
+  for(let i=0;i<TRACK_N;i++) tracks.setMatrixAt(i,tDummy.matrix);
+  tracks.instanceMatrix.needsUpdate=true;
+}
+function addTrack(x,y,z,yaw){
+  tDummy.position.set(x,y+.20,z); tDummy.rotation.set(-Math.PI/2,yaw,0);
+  tDummy.scale.set(1,1,1); tDummy.updateMatrix();
+  tracks.setMatrixAt(trackI,tDummy.matrix); tracks.instanceMatrix.needsUpdate=true;
+  trackI=(trackI+1)%TRACK_N;
+}
+
+// пыль и выхлоп
+const DUST_N=260;
+const dustPos=new Float32Array(DUST_N*3), dustVel=new Float32Array(DUST_N*3),
+      dustLife=new Float32Array(DUST_N), dustCol=new Float32Array(DUST_N*3);
+const dustGeo=new THREE.BufferGeometry();
+dustGeo.setAttribute('position',new THREE.BufferAttribute(dustPos,3));
+dustGeo.setAttribute('color',   new THREE.BufferAttribute(dustCol,3));
+const dust=new THREE.Points(dustGeo,new THREE.PointsMaterial({size:.62,vertexColors:true,
+  transparent:true,opacity:.55,depthWrite:false}));
+dust.frustumCulled=false; scene.add(dust);
+for(let i=0;i<DUST_N;i++) dustPos[i*3+1]=-500;
+let dustI=0;
+function spawnDust(x,y,z,r=0.79,g=0.70,b=0.54,up=1){
+  const i=dustI; dustI=(dustI+1)%DUST_N;
+  dustPos[i*3]=x; dustPos[i*3+1]=y+.2; dustPos[i*3+2]=z;
+  dustVel[i*3]=(Math.random()-.5)*2.2; dustVel[i*3+1]=(1+Math.random()*1.6)*up; dustVel[i*3+2]=(Math.random()-.5)*2.2;
+  dustCol[i*3]=r; dustCol[i*3+1]=g; dustCol[i*3+2]=b;
+  dustLife[i]=.9;
+}
+
+// искры от ударов
+const SPARK_N=140;
+const sparkPos=new Float32Array(SPARK_N*3), sparkVel=new Float32Array(SPARK_N*3), sparkLife=new Float32Array(SPARK_N);
+const sparkGeo=new THREE.BufferGeometry();
+sparkGeo.setAttribute('position',new THREE.BufferAttribute(sparkPos,3));
+const sparks=new THREE.Points(sparkGeo,new THREE.PointsMaterial({color:0xFFB25A,size:.42,
+  transparent:true,opacity:.95,depthWrite:false,blending:THREE.AdditiveBlending}));
+sparks.frustumCulled=false; scene.add(sparks);
+for(let i=0;i<SPARK_N;i++) sparkPos[i*3+1]=-500;
+let sparkI=0;
+function spawnSparks(x,y,z,n){
+  for(let k=0;k<n;k++){
+    const i=sparkI; sparkI=(sparkI+1)%SPARK_N;
+    sparkPos[i*3]=x; sparkPos[i*3+1]=y+.6; sparkPos[i*3+2]=z;
+    sparkVel[i*3]=(Math.random()-.5)*11; sparkVel[i*3+1]=2+Math.random()*7; sparkVel[i*3+2]=(Math.random()-.5)*11;
+    sparkLife[i]=.45+Math.random()*.35;
+  }
+}
+
+/* --- дождь: короткие штрихи, наклон зависит от ветра и скорости машины --- */
+const RAIN_N=1200, RAIN_BOX=95, RAIN_TOP=48;
+const rainPos=new Float32Array(RAIN_N*6);          // по две вершины на каплю
+const rainDrops=[];
+for(let i=0;i<RAIN_N;i++) rainDrops.push({
+  x:(Math.random()-.5)*RAIN_BOX, y:Math.random()*RAIN_TOP, z:(Math.random()-.5)*RAIN_BOX,
+  v:46+Math.random()*26, len:0.9+Math.random()*1.5
+});
+const rainGeo=new THREE.BufferGeometry();
+rainGeo.setAttribute('position',new THREE.BufferAttribute(rainPos,3));
+const rainMat=new THREE.LineBasicMaterial({color:0xBFD8E8,transparent:true,opacity:0,
+  depthWrite:false,fog:true});
+const rain=new THREE.LineSegments(rainGeo,rainMat);
+rain.frustumCulled=false; rain.visible=false; scene.add(rain);
+
+// пересчёт капель: p0 — низ штриха, p1 — хвост вдоль вектора движения
+function updateRain(dt){
+  const wx=-5.5-S.vx*0.30, wz=-1.5-S.vz*0.30;    // ветер + снос от скорости машины
+  for(let i=0;i<RAIN_N;i++){
+    const d=rainDrops[i];
+    d.y-=d.v*dt; d.x+=wx*dt; d.z+=wz*dt;
+    if(d.y<0){
+      d.y=RAIN_TOP; d.x=(Math.random()-.5)*RAIN_BOX; d.z=(Math.random()-.5)*RAIN_BOX;
+    }
+    const k=d.len/d.v;                             // длина хвоста во времени
+    const o=i*6;
+    rainPos[o]=d.x;          rainPos[o+1]=d.y;          rainPos[o+2]=d.z;
+    rainPos[o+3]=d.x-wx*k;   rainPos[o+4]=d.y+d.v*k;    rainPos[o+5]=d.z-wz*k;
+  }
+  rainGeo.attributes.position.needsUpdate=true;
+}
+
+/* --- встречный трафик: катается по линиям дорог, переиспользуется вокруг игрока --- */
+const TRAFFIC_N=15, traffic=[];
+const tBody=new THREE.InstancedMesh(new THREE.BoxGeometry(2.0,.8,4.4),
+  new THREE.MeshLambertMaterial({flatShading:true}), TRAFFIC_N);
+const tCab =new THREE.InstancedMesh(new THREE.BoxGeometry(1.7,.6,2.0),
+  new THREE.MeshLambertMaterial({color:0x2C3E4A,flatShading:true}), TRAFFIC_N);
+tBody.castShadow=tCab.castShadow=true; tBody.frustumCulled=tCab.frustumCulled=false;
+scene.add(tBody); scene.add(tCab);
+{
+  const palette=[0xB8422F,0x2F6FB8,0xE0E2E4,0x3F7A46,0x8A8F96,0xE0A423];
+  const c=new THREE.Color();
+  for(let i=0;i<TRAFFIC_N;i++){
+    traffic.push({x:0,z:0,yaw:0,v:14,axis:0,dir:1,line:0,alive:false});
+    c.setHex(palette[i%palette.length]); tBody.setColorAt(i,c);
+  }
+  tBody.instanceColor.needsUpdate=true;
+}
+const tDum=new THREE.Object3D();
+
+// поставить машину на дорогу в кольце 120..340 от игрока
+function spawnTraffic(t){
+  for(let a=0;a<12;a++){
+    const axis=Math.random()<.5?0:1;                 // 0 — вдоль Z, 1 — вдоль X
+    const line=LINES[Math.floor(Math.random()*LINES.length)];
+    const dir=Math.random()<.5?1:-1;
+    const along=(axis===0?S.z:S.x)+(120+Math.random()*220)*(Math.random()<.5?1:-1);
+    if(Math.abs(along)>MAP-60) continue;
+    // правостороннее движение: смещение в сторону "право" от курса
+    const off=4.6*dir*(axis===0?-1:1);
+    const x=axis===0?line+off:along, z=axis===0?along:line+off;
+    if((x-S.x)**2+(z-S.z)**2 < 110*110) continue;
+    t.axis=axis; t.line=line; t.dir=dir; t.x=x; t.z=z;
+    t.v=11+Math.random()*11;
+    t.yaw=axis===0 ? (dir>0?0:Math.PI) : (dir>0?Math.PI/2:-Math.PI/2);
+    t.alive=true; return;
+  }
+  t.alive=false;
+}
+
+function updateTraffic(dt){
+  for(let i=0;i<TRAFFIC_N;i++){
+    const t=traffic[i];
+    if(!t.alive){ if(Math.random()<dt*1.5) spawnTraffic(t); }
+    if(!t.alive){ tDum.position.set(0,-500,0); tDum.updateMatrix();
+      tBody.setMatrixAt(i,tDum.matrix); tCab.setMatrixAt(i,tDum.matrix); continue; }
+
+    if(t.axis===0) t.z += t.dir*t.v*dt; else t.x += t.dir*t.v*dt;
+    const d2=(t.x-S.x)**2+(t.z-S.z)**2;
+    if(d2>620*620 || Math.abs(t.x)>MAP-40 || Math.abs(t.z)>MAP-40){ t.alive=false; continue; }
+
+    const y=heightAt(t.x,t.z);
+    tDum.position.set(t.x,y+.75,t.z); tDum.rotation.set(0,t.yaw,0); tDum.scale.set(1,1,1);
+    tDum.updateMatrix(); tBody.setMatrixAt(i,tDum.matrix);
+    tDum.position.y=y+1.45; tDum.position.x-=Math.sin(t.yaw)*.3; tDum.position.z-=Math.cos(t.yaw)*.3;
+    tDum.updateMatrix(); tCab.setMatrixAt(i,tDum.matrix);
+
+    // столкновение с игроком
+    if(d2<12 && S.mode==='play'){
+      const d=Math.max(Math.sqrt(d2),.001), nx=(S.x-t.x)/d, nz=(S.z-t.z)/d;
+      S.x=t.x+nx*3.6; S.z=t.z+nz*3.6;
+      impact(Math.abs(S.speed)+t.v, nx, nz);
+      t.alive=false;
+    }
+  }
+  tBody.instanceMatrix.needsUpdate=true; tCab.instanceMatrix.needsUpdate=true;
+}
+
+/* ============================================================
+   7. СОСТОЯНИЕ ИГРЫ
+   ============================================================ */
+const S = {
+  mode:'menu',            // menu | play | refuel | over
+  x:0, z:-40, yaw:0, speed:0, lat:0, vx:0, vz:0, steer:0,
+  fuel:TANK_BASE, tankMax:TANK_BASE, found:0, score:0, time:0,
+  night:0, rain:0, refuelT:0, beepT:0, brakeT:0, dryT:0, shake:0,
+  engineOn:false, refuelBefore:1,
+  combo:1, leak:0, stTimer:90, stMax:90, pingT:0, drift:0, driftBank:0,
+  zoneX:0, zoneZ:0,
+  // перки и модификаторы
+  eco:1, lockR:LOCK, kits:0, stBonus:0, gripBonus:0, spd:1, canCount:2,
+  perks:{},                       // сколько раз взят каждый перк — для подписи на карточке
+  // статистика партии
+  dist:0, bestDrift:0, maxCombo:1, trail:[], trailT:0,
+  // сервис
+  paused:false, muted:false, rainT:0, tut:0, clock:0, dayPhase:'',
+  prevSpeed:0, pitchD:0, rollD:0
+};
+const input={f:0,b:0,l:0,r:0,hand:0,tsteer:0};
+
+addEventListener('keydown',e=>onKey(e,1));
+addEventListener('keyup',  e=>onKey(e,0));
+function onKey(e,v){
+  const k=e.code;
+  if(v===1 && k==='Escape'){ togglePause(); e.preventDefault(); return; }
+  if(v===1 && k==='KeyM'){ toggleSound(); e.preventDefault(); return; }
+  // рестарт с клавиатуры на экранах меню и проигрыша
+  if(v===1 && (k==='KeyR'||k==='Enter'||(k==='Space'&&S.mode!=='play'&&S.mode!=='refuel'))){
+    if(S.mode==='menu' || S.mode==='over'){ Sfx.init(); reset(); e.preventDefault(); return; }
+  }
+  if(k==='KeyW'||k==='ArrowUp') input.f=v;
+  else if(k==='KeyS'||k==='ArrowDown') input.b=v;
+  else if(k==='KeyA'||k==='ArrowLeft') input.l=v;
+  else if(k==='KeyD'||k==='ArrowRight') input.r=v;
+  else if(k==='Space') input.hand=v;
+  else return;
+  e.preventDefault();
+}
+
+/* --- пауза, звук, качество --- */
+function togglePause(){
+  if(S.mode!=='play' && !S.paused) return;
+  S.paused=!S.paused;
+  document.getElementById('pause').classList.toggle('hidden',!S.paused);
+  if(S.paused) Sfx.mute();
+}
+function toggleSound(){
+  S.muted=!S.muted;
+  if(Sfx.ready) Sfx.master.gain.setTargetAtTime(S.muted?0:0.5, Sfx.ctx.currentTime, .05);
+  const b=document.getElementById('o-sound');
+  if(b) b.textContent='ЗВУК: '+(S.muted?'ВЫКЛ':'ВКЛ');
+}
+let shadowsOn=true, hiQuality=true;
+function applyQuality(){
+  renderer.shadowMap.enabled=shadowsOn;
+  renderer.setPixelRatio(hiQuality?Math.min(devicePixelRatio,1.75):1);
+  scene.traverse(o=>{ if(o.material){ const m=o.material;
+    (Array.isArray(m)?m:[m]).forEach(x=>x.needsUpdate=true); } });
+  const a=document.getElementById('o-shadow'), b=document.getElementById('o-quality');
+  if(a) a.textContent='ТЕНИ: '+(shadowsOn?'ВКЛ':'ВЫКЛ');
+  if(b) b.textContent='КАЧЕСТВО: '+(hiQuality?'ВЫСОКОЕ':'БЫСТРОЕ');
+}
+
+/* --- сенсорное управление --- */
+function initTouch(){
+  const coarse = matchMedia('(pointer:coarse)').matches || 'ontouchstart' in window;
+  if(!coarse) return;
+  const wrap=document.getElementById('touch'); wrap.classList.remove('hidden');
+  document.body.classList.add('touch');   // включает компактную раскладку HUD
+  const pad=document.getElementById('tpad'), knob=document.getElementById('tknob');
+  let padId=null;
+  const setSteer=(e)=>{
+    const t=[...e.touches].find(t=>t.identifier===padId); if(!t) return;
+    const r=pad.getBoundingClientRect();
+    const dx=clamp((t.clientX-(r.left+r.width/2))/(r.width/2),-1,1);
+    input.tsteer=-dx;                       // экран вправо = поворот вправо
+    knob.style.transform=`translateX(${dx*36}px)`;
+  };
+  pad.addEventListener('touchstart',e=>{ padId=e.changedTouches[0].identifier; setSteer(e); e.preventDefault(); },{passive:false});
+  pad.addEventListener('touchmove', e=>{ setSteer(e); e.preventDefault(); },{passive:false});
+  const endPad=e=>{ padId=null; input.tsteer=0; knob.style.transform='translateX(0)'; };
+  pad.addEventListener('touchend',endPad); pad.addEventListener('touchcancel',endPad);
+
+  const hold=(id,key)=>{
+    const b=document.getElementById(id);
+    b.addEventListener('touchstart',e=>{ input[key]=1; e.preventDefault(); },{passive:false});
+    b.addEventListener('touchend',  e=>{ input[key]=0; e.preventDefault(); },{passive:false});
+    b.addEventListener('touchcancel',()=>{ input[key]=0; });
+  };
+  hold('t-gas','f'); hold('t-brake','b'); hold('t-hand','hand');
+
+  // пауза: на телефоне клавиши Esc нет
+  const pb=document.getElementById('t-pause');
+  pb.addEventListener('touchstart',e=>{ togglePause(); e.preventDefault(); },{passive:false});
+  pb.addEventListener('click',()=>togglePause());   // preventDefault выше гасит синтетический клик
+}
+
+// сложность
+const burnMult   = ()=>1 + S.found*0.08;
+const nextDist   = ()=>S.found===0 ? 170 : Math.min(360 + (S.found-1)*85, 1400);
+const activeBarr = ()=>S.found<2 ? 0 : Math.min(barrierList.length, (S.found-1)*11);
+
+// Таймер станции обязан быть согласован с дистанцией до неё, иначе кривые расходятся:
+// дистанция росла на 85 м за станцию, таймер падал на 5 с, и на 10-й АЗС требуемая средняя
+// скорость впервые превышала реальный потолок машины (~27.7 м/с). Станция закрывалась раньше,
+// чем до неё можно было доехать, и партия вставала намертво.
+const PATH_K     = 1.25;   // петляние по сетке дорог вместо прямой
+const SEARCH_V   = 20;     // средняя скорость по маршруту, м/с (72% от потолка)
+const SEARCH_T   = 16;     // секунды на поиск точки внутри зоны
+// первая станция без таймера — это обучение
+const stationLife= ()=>S.found===0 ? Infinity
+  : Math.max(48, 95 - (S.found-1)*5, nextDist()*PATH_K/SEARCH_V + SEARCH_T) + S.stBonus;
+
+// свободно ли место: крупные объекты держим на расстоянии, фонари — вплотную нельзя
+function clearSpot(x,z,relaxed){
+  const lim=activeBarr();
+  for(const c of colliders){
+    if(c.idx!==undefined && c.idx>=lim) continue;
+    const need = c.r>=1 ? (relaxed?12:20) : (relaxed?5:7);
+    if((c.x-x)**2+(c.z-z)**2 < need*need) return false;
+  }
+  return true;
+}
+
+const EDGE = 55;                                   // запас до края карты под габариты АЗС
+const inMap = (x,z)=>Math.abs(x)<MAP-EDGE && Math.abs(z)<MAP-EDGE;
+// линия дороги, к которой можно прижаться: крайние (пограничные) исключены
+const safeLine = v => clamp(Math.round(v/ROAD_STEP)*ROAD_STEP, -MAP+ROAD_STEP, MAP-ROAD_STEP);
+
+function placeStation(){
+  const d = nextDist();
+  for(let attempt=0; attempt<80; attempt++){
+    const relaxed = attempt>55;                    // под конец ослабляем требования к месту
+    const a=Math.random()*Math.PI*2;
+    const dist=d*(0.85+Math.random()*0.3)*(relaxed?0.65:1);
+    let x=clamp(S.x+Math.cos(a)*dist, -MAP+EDGE, MAP-EDGE);
+    let z=clamp(S.z+Math.sin(a)*dist, -MAP+EDGE, MAP-EDGE);
+    let rot=0;
+    // после 3-й АЗС часть точек уходит в поля — приходится съезжать с дорог
+    const offroad = S.found>=3 && Math.random()<0.45;
+    if(!offroad){
+      const side=Math.random()<.5?-1:1;
+      const off=ROAD_HALF+13+Math.random()*6;      // 22…28 м от оси — обочина
+      if(Math.random()<.5){                        // дорога идёт вдоль Z
+        x=safeLine(x) + side*off;
+        rot = side>0 ? Math.PI : 0;                // мачта развёрнута к дороге
+      } else {                                     // дорога идёт вдоль X
+        z=safeLine(z) + side*off;
+        rot = side>0 ? Math.PI/2 : -Math.PI/2;
+      }
+    }
+    // ни на полотне, ни на перекрёстке, ни за краем карты
+    if(onPavement(x,z,ROAD_HALF+12)) continue;
+    if(!inMap(x,z)) continue;
+    if(!clearSpot(x,z,relaxed)) continue;
+    stationPos.set(x, heightAt(x,z), z);
+    station.position.copy(stationPos);
+    station.rotation.y=rot;
+    newSearchZone();
+    return;
+  }
+  // запасной вариант: обочина ближайшей к игроку дороги, посреди перегона
+  const x=safeLine(S.x)+24;
+  const z=clamp(safeLine(S.z+ROAD_STEP)-ROAD_STEP/2, -MAP+EDGE, MAP-EDGE);
+  stationPos.set(x, heightAt(x,z), z);
+  station.position.copy(stationPos);
+  station.rotation.y=Math.PI;
+  newSearchZone();
+}
+
+// зона поиска на миникарте — станция где-то внутри, но не в центре
+function newSearchZone(){
+  const a=Math.random()*Math.PI*2, r=Math.random()*95;
+  S.zoneX=stationPos.x+Math.cos(a)*r;
+  S.zoneZ=stationPos.z+Math.sin(a)*r;
+  S.stMax=stationLife(); S.stTimer=S.stMax;
+  // погода: с 6-й АЗС дождь приходит эпизодами, а не навсегда
+  if(S.found>=6 && S.rainT<=0 && Math.random()<0.55) S.rainT=55+Math.random()*35;
+}
+
+function placeCans(){
+  cans.forEach((c,ci)=>{
+    if(ci>=S.canCount){ c.taken=true; c.mesh.visible=false; return; }
+    for(let a=0;a<20;a++){
+      const t=0.25+Math.random()*0.7;
+      const x=clamp(lerp(S.x,stationPos.x,t)+(Math.random()*2-1)*90,-MAP+30,MAP-30);
+      const z=clamp(lerp(S.z,stationPos.z,t)+(Math.random()*2-1)*90,-MAP+30,MAP-30);
+      if(colliders.some(o=>(o.x-x)**2+(o.z-z)**2<100)) continue;
+      c.mesh.position.set(x,heightAt(x,z)+.75,z); c.mesh.visible=true; c.taken=false; return;
+    }
+    c.taken=true; c.mesh.visible=false;
+  });
+}
+
+function reset(){
+  S.mode='play'; S.x=0; S.z=-40; S.yaw=0; S.speed=0; S.lat=0; S.vx=0; S.vz=0; S.steer=0;
+  S.tankMax=TANK_BASE; S.fuel=S.tankMax;
+  S.found=0; S.score=0; S.time=0; S.night=0; S.rain=0; S.rainT=0; S.shake=0;
+  S.refuelT=0; S.dryT=0; S.beepT=0; S.brakeT=0; S.refuelBefore=1;
+  S.combo=1; S.leak=0; S.pingT=0; S.drift=0; S.driftBank=0;
+  S.eco=1; S.lockR=LOCK; S.kits=0; S.stBonus=0; S.gripBonus=0; S.spd=1; S.canCount=2;
+  S.perks={};
+  S.dist=0; S.bestDrift=0; S.maxCombo=1; S.trail.length=0; S.trailT=0;
+  S.paused=false; S.tut=0; S.clock=0; S.dayPhase='';
+  S.prevSpeed=0; S.pitchD=0; S.rollD=0;
+  input.f=input.b=input.l=input.r=input.hand=0; input.tsteer=0;
+  barriers.count=0;
+  traffic.forEach(t=>t.alive=false);
+  placeStation(); placeCans();
+  car.position.set(S.x,heightAt(S.x,S.z),S.z);
+  el.vig.classList.remove('on'); el.warn.classList.remove('on');
+  Sfx.init(); Sfx.ignition(); Sfx.rain(0); S.engineOn=true;
+  $('over').classList.remove('win');
+  $('over').classList.add('hidden');
+  $('menu').classList.add('hidden');
+  $('perk').classList.add('hidden');
+  $('pause').classList.add('hidden');
+  showToast('ЕДЬ ЗА СИГНАЛОМ ДЕТЕКТОРА');
+}
+
+/* ============================================================
+   7b. ПЕРКИ — выбор после каждой заправки
+   ============================================================ */
+const PERKS = [
+  {t:'БОЛЬШЕ БАК',       d:'+6 литров к объёму бака. Заливается сразу.',
+   f:()=>{ S.tankMax+=6; S.fuel=S.tankMax; }},
+  {t:'ЭКОНОМИЧНЫЙ ХОД',  d:'−12% расхода топлива до конца партии.',
+   f:()=>{ S.eco*=0.88; }},
+  {t:'МОЩНЫЙ ДЕТЕКТОР',  d:'+70 м к радиусу захвата АЗС.',
+   f:()=>{ S.lockR+=70; }},
+  {t:'РЕМКОМПЛЕКТ',      d:'Один раз автоматически заделает пробитый бак.',
+   f:()=>{ S.kits++; }},
+  {t:'НОЧНАЯ СМЕНА',     d:'+15 секунд к работе каждой следующей АЗС.',
+   f:()=>{ S.stBonus+=15; }},
+  {t:'ЗИМНЯЯ РЕЗИНА',    d:'Держит на грунте и в дождь заметно лучше.',
+   f:()=>{ S.gripBonus+=1.6; }},
+  // Канистр физически столько, сколько мешей в пуле. Упёршийся в потолок перк
+  // молча не делал ничего, поэтому при максимуме его просто не предлагаем — см. maxed.
+  {t:'КАНИСТРЫ',         d:'+2 канистры на маршруте к следующей АЗС.',
+   f:()=>{ S.canCount=Math.min(cans.length,S.canCount+2); placeCans(); },
+   maxed:()=>S.canCount>=cans.length},
+  {t:'ФОРСАЖ',           d:'+12% к максимальной скорости.',
+   f:()=>{ S.spd*=1.12; }}
+];
+
+function showPerks(){
+  S.mode='perk';
+  Sfx.mute();
+  const box=$('cards'); box.innerHTML='';
+  const pool=PERKS.filter(p=>!(p.maxed && p.maxed()));   // упёршиеся в потолок не предлагаем
+  if(!pool.length){ closePerks('ВСЕ УЛУЧШЕНИЯ ВЗЯТЫ'); return; }
+  for(let i=0;i<3 && pool.length;i++){
+    const p=pool.splice(Math.floor(Math.random()*pool.length),1)[0];
+    const have=S.perks[p.t]||0;
+    const card=document.createElement('button');
+    card.className='card';
+    card.innerHTML=`<b>${p.t}${have?`<i>УЖЕ ×${have}</i>`:''}</b><span>${p.d}</span>`;
+    card.addEventListener('click',()=>{
+      S.perks[p.t]=have+1;
+      p.f();
+      closePerks(p.t, have+1);
+    });
+    box.appendChild(card);
+  }
+  $('perk').classList.remove('hidden');
+  setTimeout(()=>{ const c=box.firstChild; if(c) c.focus(); },30);
+}
+
+function closePerks(name, count){
+  $('perk').classList.add('hidden');
+  S.mode='play';
+  Sfx.ignition();
+  showToast(count>1 ? `${name} ×${count}` : name);   // видно, что перк копится
+}
+
+
+/* ============================================================
+   8. ФИЗИКА МАШИНЫ — аркадная модель с боковым скольжением
+   ============================================================ */
+const MAX_SPEED=42, MAX_REV=13, ACCEL=27, BRAKE=42, MAX_STEER=0.56;
+
+// Удар: гасит скорость, сбрасывает серию, может пробить бак
+function impact(force, nx, nz){
+  if(force<6) { S.vx*=-0.22; S.vz*=-0.22; return; }
+  Sfx.hit();
+  S.shake=Math.min(force/MAX_SPEED,1)*.6;
+  spawnSparks(S.x-nx*1.6, heightAt(S.x,S.z)+0.7, S.z-nz*1.6, 10+Math.round(force*0.6));
+  const vn=S.vx*nx+S.vz*nz;
+  S.vx-=1.25*vn*nx; S.vz-=1.25*vn*nz;
+  S.vx*=0.45; S.vz*=0.45;
+  if(S.combo>1){ S.combo=1; showToast('СЕРИЯ СБРОШЕНА'); }
+  // сильный удар рвёт бак: топливо течёт, пока не заправишься
+  if(force>19 && Math.random()<0.55 && S.leak===0 && S.fuel>1){
+    if(S.kits>0){ S.kits--; showToast('РЕМКОМПЛЕКТ СРАБОТАЛ'); }
+    else { S.leak=0.34; Sfx.leak(); showToast('ПРОБИТ БАК'); }
+  }
+}
+
+function drive(dt){
+  const off = !onRoad(S.x,S.z);
+  const hasFuel = S.fuel>0.01;
+  const reserve = S.fuel<3;                       // последние литры — тихий ход
+  const water = inLake(S.x,S.z);                  // в озере вязко
+  let gripMax = (off?MAX_SPEED*0.62:MAX_SPEED)*(1-S.rain*0.06)*S.spd;
+  if(water) gripMax=Math.min(gripMax, MAX_SPEED*0.3);
+  if(reserve) gripMax=Math.min(gripMax,11.5);
+
+  // руль: клавиши или сенсорный джойстик; чем быстрее, тем меньше угол
+  const steerIn = clamp((input.l?1:0)-(input.r?1:0)+input.tsteer,-1,1);
+  const target  = steerIn*MAX_STEER*(1-0.62*Math.min(Math.abs(S.speed)/MAX_SPEED,1));
+  S.steer = lerp(S.steer, target, 1-Math.exp(-9*dt));
+
+  // кузов доворачивается…
+  S.yaw += (S.speed/WHEELBASE)*Math.tan(S.steer)*dt;
+
+  // …а скорость остаётся в мире: раскладываем её в НОВОЙ системе машины
+  const fx=Math.sin(S.yaw), fz=Math.cos(S.yaw), rx=-Math.cos(S.yaw), rz=Math.sin(S.yaw);
+  let vF = S.vx*fx + S.vz*fz;      // вдоль кузова
+  let vL = S.vx*rx + S.vz*rz;      // поперёк — это и есть занос
+
+  let throttle=0;
+  if(hasFuel){
+    // Тяга масштабируется тем же S.spd, что и потолок. Иначе Форсаж почти не чувствуется:
+    // сопротивление уравновешивает разгон задолго до gripMax, и поднятый потолок недостижим.
+    if(input.f){ throttle=1; vF += ACCEL*S.spd*(1-Math.min(vF/gripMax,1))*dt; }
+    else if(input.b){
+      if(vF>0.6) vF -= BRAKE*dt;
+      else { throttle=.6; vF -= ACCEL*.55*dt; }        // задний ход
+    }
+  }
+  if(input.hand && Math.abs(vF)>0.2) vF -= BRAKE*0.85*dt*Math.sign(vF);
+
+  const drag = (off?1.9:0.8) + (hasFuel?0:2.4) + (water?3.4:0);
+  vF -= vF*drag*dt*0.35;
+  vF -= Math.sign(vF)*(off?3.2:1.4)*dt;
+  if(Math.abs(vF)<0.12) vF=0;
+  vF = clamp(vF,-MAX_REV,gripMax);
+
+  // боковое сцепление: асфальт держит, грунт и дождь — хуже, ручник срывает корму
+  let grip = ((off?4.6:9.2)+S.gripBonus)*(1-S.rain*0.42);
+  if(input.hand) grip = 1.4;
+  vL *= Math.exp(-grip*dt);
+  if(input.hand && Math.abs(vF)>7) vL += S.steer*Math.abs(vF)*2.0*dt;
+  vL = clamp(vL,-26,26);
+  vL -= Math.sign(vL)*0.8*dt;
+
+  S.speed=vF; S.lat=vL;
+  S.vx = fx*vF + rx*vL; S.vz = fz*vF + rz*vL;
+  S.x += S.vx*dt; S.z += S.vz*dt;
+  S.x = clamp(S.x,-MAP+12,MAP-12); S.z = clamp(S.z,-MAP+12,MAP-12);
+
+  // столкновения — только соседние ячейки сетки
+  const cx=Math.floor(S.x/cellSize), cz=Math.floor(S.z/cellSize), lim=activeBarr();
+  for(let i=-1;i<=1;i++) for(let j=-1;j<=1;j++){
+    const arr=grid.get(key(cx+i,cz+j)); if(!arr) continue;
+    for(const c of arr){
+      if(c.idx!==undefined && c.idx>=lim) continue;
+      const dx=S.x-c.x, dz=S.z-c.z, rr=c.r+1.5;
+      const d2=dx*dx+dz*dz;
+      if(d2<rr*rr && d2>0.0001){
+        const d=Math.sqrt(d2), nx=dx/d, nz=dz/d;
+        S.x=c.x+nx*rr; S.z=c.z+nz*rr;
+        impact(Math.hypot(S.vx,S.vz), nx, nz);
+      }
+    }
+  }
+  S.speed = S.vx*fx + S.vz*fz;
+
+  // расход топлива: накат ≈ бесплатно, газ — дорого, поле — дороже
+  S.dist += Math.hypot(S.vx,S.vz)*dt;
+  if(hasFuel && S.mode==='play'){
+    const v=Math.abs(S.speed)/MAX_SPEED;
+    const burn = ((throttle>0 ? (0.16 + Math.pow(v,1.5)*0.80) : 0.025*(v>0.02?1:0.6))
+               * (off?1.35:1) * burnMult() * S.eco * (reserve?0.34:1)) + S.leak;
+    S.fuel = Math.max(0, S.fuel - burn*dt);
+    if(S.fuel===0){ S.dryT=0; Sfx.mute(); Sfx.gameOver(); S.engineOn=false; }
+  }
+  return {off, throttle, reserve};
+}
+
+/* ============================================================
+   9. HUD
+   ============================================================ */
+const $ = id=>document.getElementById(id);
+const el = {
+  az:$('s-az'), score:$('s-score'), time:$('s-time'), combo:$('s-combo'), fps:$('s-fps'),
+  fuelnum:$('fuelnum'), fuelpct:$('fuelpct'),
+  speed:$('speed'), mode:$('mode'), cdist:$('cdist'),
+  mapbox:$('mapbox'), ping:$('ping'),
+  sttimer:$('sttimer'), stfill:$('stfill'), sttext:$('sttext'),
+  vig:$('vignette'), warn:$('warn'), toast:$('toast'), box:$('fuelbox'), streaks:$('streaks')
+};
+const SEGS=16, segs=[];
+for(let i=0;i<SEGS;i++){ const s=document.createElement('i'); $('col').appendChild(s); segs.push(s); }
+
+const mmCtx=$('minimap').getContext('2d');
+const MM=$('minimap').width, MMR=MM/2;
+const RING_W=MM*0.055;              // ширина ободка со шкалой сигнала
+const RING_R=MMR-RING_W/2-1;        // радиус середины ободка
+const MAPR=MMR-RING_W-3;            // радиус самой карты
+const MMSCALE=MAPR/460;             // масштаб: те же 460 юнитов обзора, что и раньше
+
+function fmtTime(t){ const m=Math.floor(t/60), s=Math.floor(t%60); return m+':'+String(s).padStart(2,'0'); }
+
+function showToast(text){ el.toast.textContent=text; el.toast.classList.remove('show');
+  void el.toast.offsetWidth; el.toast.classList.add('show'); }
+
+function updateHud(off){
+  const pct=S.fuel/S.tankMax;
+  el.az.textContent=S.found+' / '+GOAL;
+  el.score.textContent=S.score;
+  el.time.textContent=fmtTime(S.time);
+  el.fuelnum.innerHTML=S.fuel.toFixed(1)+'<small> Л</small>';
+  el.fuelpct.textContent=Math.round(pct*100)+'%';
+  el.speed.textContent=Math.round(Math.abs(S.speed)*3.6);
+  // линии скорости проявляются только на верхней трети диапазона
+  el.streaks.style.opacity=(clamp((Math.abs(S.speed)/MAX_SPEED-0.55)/0.45,0,1)*0.5).toFixed(2);
+
+  el.combo.textContent='×'+S.combo;
+  el.combo.className = S.combo>1 ? 'hot' : '';
+  const lit=Math.ceil(pct*SEGS);
+  for(let i=0;i<SEGS;i++){
+    segs[i].className = i<lit ? (pct<0.2?'warn':'on') : '';
+  }
+  el.box.classList.toggle('low', pct<0.2);
+  el.vig.classList.toggle('on', (pct<0.2||S.leak>0) && S.mode==='play');
+  el.warn.classList.toggle('on', (pct<0.2||S.leak>0) && S.mode==='play');
+  el.warn.textContent = S.leak>0 ? 'ПРОБИТ БАК — ТОПЛИВО УХОДИТ' : 'НИЗКИЙ УРОВЕНЬ ТОПЛИВА';
+
+  // режим движения
+  if(S.mode==='refuel') { el.mode.textContent='ЗАПРАВКА'; el.mode.style.color='var(--ok)'; }
+  else if(S.fuel<3 && S.fuel>0){ el.mode.textContent='РЕЗЕРВ — ТИХИЙ ХОД'; el.mode.style.color='var(--red)'; }
+  else if(Math.abs(S.lat)>3.2 && Math.abs(S.speed)>10){
+    el.mode.textContent='ЗАНОС +'+Math.round(S.driftBank); el.mode.style.color='var(--amber)'; }
+  else if(!input.f && !input.b && Math.abs(S.speed)>4){ el.mode.textContent='НАКАТ'; el.mode.style.color='var(--ok)'; }
+  else if(off && Math.abs(S.speed)>2){ el.mode.textContent='БЕЗДОРОЖЬЕ ×1.35'; el.mode.style.color='var(--red)'; }
+  else el.mode.textContent='';
+
+  // детектор: сила сигнала всегда, направление — только при захвате.
+  // Шкала и метка направления рисуются на ободке карты, здесь только подпись.
+  const det=detector();
+  el.mapbox.classList.toggle('lock', det.lock);
+  el.cdist.textContent = det.lock ? Math.round(det.dist)+' М'
+                                  : 'СИГНАЛ '+Math.round(det.sig*100)+'%';
+
+  // таймер работы АЗС
+  if(!isFinite(S.stMax)){
+    el.stfill.style.width='100%';
+    el.sttext.textContent='ПЕРВАЯ АЗС ЖДЁТ';
+    el.sttimer.classList.remove('soon');
+  } else {
+    const left=Math.max(0,S.stTimer);
+    el.stfill.style.width=Math.round(left/S.stMax*100)+'%';
+    el.sttext.textContent='ЗАКРЫТИЕ ЧЕРЕЗ '+Math.ceil(left)+' С';
+    el.sttimer.classList.toggle('soon', left<15);
+  }
+}
+
+/* Показания детектора: сила сигнала есть всегда, направление — только при захвате.
+   Считается в одном месте, потому что нужно и подписи в HUD, и отрисовке ободка. */
+function detector(){
+  const dx=stationPos.x-S.x, dz=stationPos.z-S.z;
+  const dist=Math.hypot(dx,dz);
+  const lock=dist<=S.lockR;
+  // курсовой угол на станцию: 0 — прямо по носу, как у старой стрелки компаса
+  const bearing = lock ? Math.atan2(dx*(-Math.cos(S.yaw))+dz*Math.sin(S.yaw),
+                                    dx*Math.sin(S.yaw)+dz*Math.cos(S.yaw)) : 0;
+  return { dist, lock, bearing, sig:clamp(1-dist/900,0,1) };
+}
+
+function drawMinimap(){
+  const c=mmCtx, k=MM/150;          // маркеры в пикселях канвы — от её размера
+  c.setTransform(1,0,0,1,0,0);
+  c.clearRect(0,0,MM,MM);
+  c.fillStyle='#0A0D12';
+  c.beginPath(); c.arc(MMR,MMR,MMR,0,6.283); c.fill();
+  c.save();
+  c.beginPath(); c.arc(MMR,MMR,MAPR,0,6.283); c.clip();
+
+  // мир в системе координат машины (нос — вверх)
+  c.translate(MMR,MMR); c.rotate(S.yaw+Math.PI); c.scale(MMSCALE,MMSCALE); c.translate(-S.x,-S.z);
+
+  c.strokeStyle='rgba(237,230,216,.22)'; c.lineWidth=ROAD_HALF*1.6;
+  for(let f=-MAP; f<=MAP; f+=ROAD_STEP){
+    if(Math.abs(f-S.x)<520){ c.beginPath(); c.moveTo(f,S.z-520); c.lineTo(f,S.z+520); c.stroke(); }
+    if(Math.abs(f-S.z)<520){ c.beginPath(); c.moveTo(S.x-520,f); c.lineTo(S.x+520,f); c.stroke(); }
+  }
+  // след маршрута — видно, где уже искал
+  if(S.trail.length>=4){
+    c.strokeStyle='rgba(255,176,32,.35)'; c.lineWidth=10; c.beginPath();
+    c.moveTo(S.trail[0],S.trail[1]);
+    for(let i=2;i<S.trail.length;i+=2) c.lineTo(S.trail[i],S.trail[i+1]);
+    c.lineTo(S.x,S.z); c.stroke();
+  }
+  // канистры
+  c.fillStyle='#F2C230';
+  cans.forEach(k=>{ if(k.taken) return;
+    c.beginPath(); c.arc(k.mesh.position.x,k.mesh.position.z,9,0,6.283); c.fill(); });
+  // встречные машины
+  c.fillStyle='rgba(237,230,216,.55)';
+  traffic.forEach(t=>{ if(!t.alive) return;
+    c.beginPath(); c.arc(t.x,t.z,7,0,6.283); c.fill(); });
+  // зона поиска и точка АЗС (точка — только при захвате)
+  const det=detector();
+  c.strokeStyle='rgba(56,255,176,.55)'; c.lineWidth=4; c.setLineDash([14,12]);
+  c.beginPath(); c.arc(S.zoneX,S.zoneZ,ZONE_R,0,6.283); c.stroke(); c.setLineDash([]);
+  if(det.lock){
+    c.fillStyle='#38FFB0';
+    c.beginPath(); c.arc(stationPos.x,stationPos.z,15,0,6.283); c.fill();
+  }
+  c.restore();
+
+  // машина
+  c.save(); c.translate(MMR,MMR);
+  c.fillStyle='#FFB020'; c.beginPath();
+  c.moveTo(0,-8*k); c.lineTo(6*k,7*k); c.lineTo(0,4*k); c.lineTo(-6*k,7*k); c.closePath(); c.fill();
+  c.restore();
+
+  // ---- детектор на ободке ----
+  // янтарь — сила сигнала, зелёный — захват: цвета не пересекаются, метку видно всегда
+  c.lineWidth=RING_W;
+  c.strokeStyle='rgba(237,230,216,.10)';
+  c.beginPath(); c.arc(MMR,MMR,RING_R,0,6.283); c.stroke();
+  if(det.sig>0.005){
+    c.strokeStyle='#FFB020';
+    c.beginPath(); c.arc(MMR,MMR,RING_R,-Math.PI/2,-Math.PI/2+6.283*det.sig); c.stroke();
+  }
+  // направление на цель — только при захвате, вместо стрелки старого компаса
+  if(det.lock){
+    c.save(); c.translate(MMR,MMR); c.rotate(det.bearing);
+    c.beginPath();
+    c.moveTo(0,-RING_R-RING_W*0.46);
+    c.lineTo(RING_W*1.0,-RING_R+RING_W*0.75);
+    c.lineTo(-RING_W*1.0,-RING_R+RING_W*0.75);
+    c.closePath();
+    c.fillStyle='#38FFB0'; c.fill();
+    c.lineWidth=RING_W*0.22; c.strokeStyle='#0A0D12'; c.stroke();   // обводка, чтобы читалась на шкале
+    c.restore();
+  }
+}
+
+/* ============================================================
+   10. ЦИКЛ
+   ============================================================ */
+const clock=new THREE.Clock();
+const camPos=new THREE.Vector3(0,8,-14), camAim=new THREE.Vector3();
+const sunDir=new THREE.Vector3(), camFwd=new THREE.Vector3(), sunScreen=new THREE.Vector3();
+const wetLens=document.getElementById('wetlens');
+const flare={ el:document.getElementById('flare'),
+              parts:[...document.querySelectorAll('#flare i')],
+              k:[1, 0.55, -0.25, -0.7] };   // положение бликов на линии «солнце → центр экрана»
+let lampEmissive=0, fpsAcc=0, fpsFrames=0, fps=60;
+
+function tick(){
+  requestAnimationFrame(tick);
+  const dt=Math.min(clock.getDelta(),0.05);
+  const t=clock.elapsedTime;
+
+  // счётчик кадров
+  fpsAcc+=dt; fpsFrames++;
+  if(fpsAcc>0.5){ fps=Math.round(fpsFrames/fpsAcc); fpsAcc=0; fpsFrames=0; el.fps.textContent=fps; }
+
+  if(S.paused){ renderer.render(scene,camera); return; }
+
+  if(S.mode==='play'||S.mode==='refuel'){
+    S.time+=dt;
+    let off=false, throttle=0;
+
+    // след маршрута для миникарты
+    S.trailT-=dt;
+    if(S.trailT<=0){ S.trail.push(S.x,S.z); S.trailT=0.6;
+      if(S.trail.length>160) S.trail.splice(0,2); }
+
+    if(S.mode==='play'){
+      const r=drive(dt); off=r.off; throttle=r.throttle;
+      updateTraffic(dt);
+
+      // --- таймер работы АЗС (первая — без таймера, это обучение)
+      if(isFinite(S.stMax)){
+        S.stTimer-=dt;
+        if(S.stTimer<=0){
+          Sfx.closed(); showToast('АЗС ЗАКРЫЛАСЬ');
+          placeStation(); placeCans();
+        }
+      }
+
+      // --- детектор: чем ближе, тем чаще пик
+      const dS=Math.hypot(stationPos.x-S.x, stationPos.z-S.z);
+      const sig=clamp(1-dS/900,0,1);
+      S.pingT-=dt;
+      if(S.pingT<=0){
+        Sfx.ping(sig);
+        el.ping.classList.remove('hit'); void el.ping.offsetWidth; el.ping.classList.add('hit');
+        S.pingT=lerp(1.9,0.16,sig*sig);
+      }
+      // подсказка при первом захвате
+      if(S.found===0 && S.tut===0 && dS<S.lockR){ S.tut=1; showToast('ЗАХВАТ — МЕТКА НА КАРТЕ ВЕДЁТ К АЗС'); }
+
+      // --- очки за занос
+      const slide=Math.abs(S.lat);
+      if(slide>3.2 && Math.abs(S.speed)>10){
+        S.driftBank += slide*dt*3.2*S.combo;
+        S.drift=0.6;
+      } else if(S.drift>0){
+        S.drift-=dt;
+        if(S.drift<=0 && S.driftBank>20){
+          S.bestDrift=Math.max(S.bestDrift,Math.round(S.driftBank));
+          S.score+=Math.round(S.driftBank); showToast('ЗАНОС +'+Math.round(S.driftBank));
+          S.driftBank=0;
+        } else if(S.drift<=0) S.driftBank=0;
+      }
+
+      // подбор канистр — заодно латают бак
+      cans.forEach(k=>{
+        if(k.taken) return;
+        if((k.mesh.position.x-S.x)**2+(k.mesh.position.z-S.z)**2<36){
+          k.taken=true; k.mesh.visible=false;
+          S.fuel=Math.min(S.tankMax,S.fuel+8); S.score+=25*S.combo;
+          const patched=S.leak>0; S.leak=0;
+          Sfx.can(); showToast(patched?'+8 Л · БАК ЗАЛАТАН':'+8 Л · +'+25*S.combo);
+        }
+      });
+
+      // достигли АЗС
+      if((stationPos.x-S.x)**2+(stationPos.z-S.z)**2<15*15 && S.fuel>0){
+        S.mode='refuel'; S.refuelT=0; Sfx.mute();
+      }
+
+      // предупреждение о низком уровне
+      if(S.fuel/S.tankMax<0.2 && S.fuel>0){
+        S.beepT-=dt; if(S.beepT<=0){ Sfx.lowFuel(); S.beepT=1.6; }
+      }
+
+      // конец игры — как только бак пуст (ждём короткого наката, но не дольше 2.5 с)
+      if(S.fuel<=0){
+        S.dryT+=dt;
+        if(Math.abs(S.speed)<1.2 || S.dryT>2.5){ S.mode='over'; gameOver(); }
+      }
+    } else {
+      // --- анимация заправки ---
+      S.speed=0; S.lat=0; S.vx=0; S.vz=0; S.refuelT+=dt;
+      S.fuel=Math.min(S.tankMax, lerp(S.fuel,S.tankMax, 1-Math.exp(-4*dt)) + 6*dt);
+      if(Math.floor(S.refuelT*8)!==Math.floor((S.refuelT-dt)*8)) Sfx.refuelTick();
+      if(S.refuelT>1.5){
+        const pctBefore=S.refuelBefore ?? 0;
+        const timeLeft=isFinite(S.stTimer)?Math.max(0,S.stTimer):0;
+        let gain = 100 + S.found*25 + Math.round(pctBefore*60) + Math.round(timeLeft*2);
+        if(pctBefore>0.5) gain*=2;
+        gain*=S.combo;
+        S.score+=gain; S.found++; S.fuel=S.tankMax; S.leak=0;
+        S.combo=Math.min(4,S.combo+1);
+        S.maxCombo=Math.max(S.maxCombo,S.combo);
+        Sfx.refuelDone();
+        showToast(`ЗАПРАВЛЕНО +${gain}${S.combo>1?' ×'+S.combo:''}`);
+        if(S.found>=GOAL){                      // цель достигнута — победа
+          S.mode='over'; finish(true);
+        } else {
+          placeStation(); placeCans();
+          barriers.count=activeBarr();
+          showPerks();
+        }
+      }
+    }
+    if(S.mode==='play') S.refuelBefore=S.fuel/S.tankMax;
+
+    /* --- машина на рельефе + крены кузова --- */
+    const y=heightAt(S.x,S.z);
+    const hF=heightAt(S.x+Math.sin(S.yaw)*2.1, S.z+Math.cos(S.yaw)*2.1);
+    const hB=heightAt(S.x-Math.sin(S.yaw)*2.1, S.z-Math.cos(S.yaw)*2.1);
+    const hL=heightAt(S.x+Math.cos(S.yaw)*1.1, S.z-Math.sin(S.yaw)*1.1);
+    const hR=heightAt(S.x-Math.cos(S.yaw)*1.1, S.z+Math.sin(S.yaw)*1.1);
+    // клевок при торможении, присед при разгоне
+    const accel=(S.speed-S.prevSpeed)/Math.max(dt,0.001); S.prevSpeed=S.speed;
+    S.pitchD=lerp(S.pitchD, clamp(-accel*0.0075,-0.10,0.10), 1-Math.exp(-7*dt));
+    // крен наружу поворота: от руля и от бокового скольжения
+    S.rollD =lerp(S.rollD,  clamp(S.steer*Math.abs(S.speed)*0.0075 + S.lat*0.006,-0.17,0.17),
+                  1-Math.exp(-6*dt));
+    car.position.set(S.x, y, S.z);
+    car.rotation.set(Math.atan2(hB-hF,4.2)+S.pitchD, S.yaw, Math.atan2(hL-hR,2.2)+S.rollD);
+
+    // колёса: поворот + вращение
+    const spin=S.speed*dt/0.45;
+    wheels.forEach(w=>{ w.rotation.x-=spin; if(w.userData.front) w.rotation.y=S.steer; });
+    car.userData.tailMat.color.setHex(input.b||input.hand?0xFF4436:0x8E1B12);
+
+    /* --- следы, пыль, выхлоп --- */
+    const sliding=Math.abs(S.lat)>2.4;
+    if(Math.abs(S.speed)>7 && (off||sliding||Math.abs(S.steer)>0.25)){
+      const bx=S.x-Math.sin(S.yaw)*1.45, bz=S.z-Math.cos(S.yaw)*1.45;
+      addTrack(bx+Math.cos(S.yaw)*0.95, heightAt(bx,bz), bz-Math.sin(S.yaw)*0.95, S.yaw);
+      addTrack(bx-Math.cos(S.yaw)*0.95, heightAt(bx,bz), bz+Math.sin(S.yaw)*0.95, S.yaw);
+      if(off||sliding) spawnDust(bx,heightAt(bx,bz),bz);
+    }
+    // выхлоп из трубы под нагрузкой и брызги в воде
+    if(throttle>0 && Math.random()<0.55){
+      const ex=S.x-Math.sin(S.yaw)*2.3+Math.cos(S.yaw)*0.5;
+      const ez=S.z-Math.cos(S.yaw)*2.3-Math.sin(S.yaw)*0.5;
+      spawnDust(ex, car.position.y+0.5, ez, .42,.44,.46, .5);
+    }
+    if(inLake(S.x,S.z) && Math.abs(S.speed)>4 && Math.random()<0.8)
+      spawnDust(S.x-Math.sin(S.yaw)*1.6, car.position.y+0.3, S.z-Math.cos(S.yaw)*1.6, .72,.86,.92, 1.4);
+
+    /* --- звук двигателя и покрышек --- */
+    if(S.engineOn){
+      const v=Math.abs(S.speed)/MAX_SPEED;
+      const screech=clamp(Math.abs(S.lat)/12,0,1);
+      Sfx.engine(v, throttle, Math.max(off?v*0.9:v*0.25, screech));
+    }
+    S.brakeT-=dt;
+    if((input.b||input.hand) && S.speed>12 && S.brakeT<=0){ Sfx.brake(); S.brakeT=0.22; }
+  }
+
+  /* --- пыль (интегрирование) --- */
+  for(let i=0;i<DUST_N;i++){
+    if(dustLife[i]>0){
+      dustLife[i]-=dt;
+      dustPos[i*3]+=dustVel[i*3]*dt;
+      dustPos[i*3+1]+=dustVel[i*3+1]*dt;
+      dustPos[i*3+2]+=dustVel[i*3+2]*dt;
+      dustVel[i*3+1]-=1.6*dt;
+      if(dustLife[i]<=0) dustPos[i*3+1]=-500;
+    }
+  }
+  dustGeo.attributes.position.needsUpdate=true;
+  dustGeo.attributes.color.needsUpdate=true;
+
+  /* --- искры --- */
+  for(let i=0;i<SPARK_N;i++){
+    if(sparkLife[i]>0){
+      sparkLife[i]-=dt;
+      sparkPos[i*3]+=sparkVel[i*3]*dt;
+      sparkPos[i*3+1]+=sparkVel[i*3+1]*dt;
+      sparkPos[i*3+2]+=sparkVel[i*3+2]*dt;
+      sparkVel[i*3+1]-=16*dt;
+      if(sparkLife[i]<=0) sparkPos[i*3+1]=-500;
+    }
+  }
+  sparkGeo.attributes.position.needsUpdate=true;
+
+  /* --- анимация АЗС --- */
+  station.userData.ring.scale.setScalar(1+Math.sin(t*2.6)*0.12);
+  station.userData.ring.position.y=0.4+Math.sin(t*2.6)*0.25;
+  station.userData.orb.rotation.y=t*1.4; station.userData.orb.rotation.x=t*0.8;
+  station.userData.orb.position.y=19.4+Math.sin(t*2)*0.5;
+  const stD=Math.hypot(stationPos.x-S.x, stationPos.z-S.z);
+  station.userData.beam.material.opacity =
+    (0.10+Math.sin(t*2.2)*0.03+S.night*0.07) * clamp((820-stD)/320,0,1);
+  station.userData.lamp.intensity=50+Math.sin(t*3)*14+S.night*90;
+  cans.forEach(k=>{ if(!k.taken){ k.mesh.rotation.y=t*1.6; k.mesh.position.y=heightAt(k.mesh.position.x,k.mesh.position.z)+.75+Math.sin(t*2+k.mesh.id)*0.12; }});
+
+  /* --- дождь: эпизоды с 6-й АЗС --- */
+  if(S.mode==='play') S.rainT-=dt;
+  const wantRain = S.rainT>0 && (S.mode==='play'||S.mode==='refuel'||S.mode==='perk') ? 1 : 0;
+  S.rain = lerp(S.rain, wantRain, 1-Math.exp(-0.35*dt));
+  rain.visible = S.rain>0.02;
+  if(rain.visible){
+    rainMat.opacity=S.rain*0.55;
+    rain.position.set(camera.position.x, camera.position.y-24, camera.position.z);
+    updateRain(dt);
+    // брызги от капель по земле вокруг машины
+    if(S.mode==='play' && Math.random()<S.rain*0.9){
+      const a=Math.random()*6.283, r=4+Math.random()*22;
+      const sx=S.x+Math.cos(a)*r, sz=S.z+Math.sin(a)*r;
+      spawnDust(sx, heightAt(sx,sz), sz, .76,.87,.94, .55);
+    }
+  }
+  wetLens.style.opacity=(S.rain*0.85).toFixed(2);
+  // мокрый асфальт и трава темнеют
+  wetMats.forEach(w=>w.mat.color.copy(w.base).multiplyScalar(1-S.rain*0.34));
+  Sfx.rain(S.rain);
+
+  /* --- суточный цикл: день ↔ ночь по кругу --- */
+  if(S.mode==='play'||S.mode==='refuel') S.clock+=dt;
+  const DAY_LEN=300;                                   // полные сутки, секунд
+  const phase=(S.clock/DAY_LEN)%1;                     // 0 — полдень, 0.5 — полночь
+  const wantNight=smooth(0.42,0.85, 0.5-0.5*Math.cos(phase*Math.PI*2));
+  S.night = lerp(S.night, wantNight, 1-Math.exp(-2.5*dt));
+  // сообщаем о смене времени суток один раз за переход
+  if(S.mode==='play'){
+    if(S.night>0.55 && S.dayPhase!=='night'){ S.dayPhase='night'; showToast('СТЕМНЕЛО'); }
+    if(S.night<0.25 && S.dayPhase!=='day'){ if(S.dayPhase) showToast('РАССВЕТ'); S.dayPhase='day'; }
+  }
+  const gloom = Math.max(S.night, S.rain*0.75);
+  const dusk = (1-Math.abs(2*S.night-1))*(1-S.rain*0.7);   // пик на переходе день↔ночь
+  palette(cSky,'sky',gloom,dusk*0.9);
+  palette(cHor,'hor',gloom,dusk);
+  palette(cFog,'fog',gloom,dusk);
+  sky.material.uniforms.top.value.copy(cSky);
+  sky.material.uniforms.bottom.value.copy(cHor);
+  scene.fog.color.copy(cFog);
+  scene.fog.far = VIEW*(1-S.rain*0.38);
+  renderer.setClearColor(cFog);
+  sun.intensity=lerp(2.1,0.28,gloom)*(1+dusk*0.25);
+  palette(sun.color,'sun',gloom,dusk);
+  hemi.intensity=lerp(1.15,0.28,gloom);
+  palette(hemi.color,'amb',gloom,dusk);
+  starMat.opacity=S.night*(1-S.rain)*0.9;
+  car.userData.beams.forEach(b=>b.intensity=Math.max(S.night,S.rain*0.7)*260);
+  lampEmissive=Math.max(S.night,S.rain*0.8);
+  if(lampMat) lampMat.emissive.setRGB(lampEmissive*0.95, lampEmissive*0.8, lampEmissive*0.45);
+  lampGlow.material.opacity=lampEmissive*0.55;
+  headGlow.forEach(h=>h.material.opacity=Math.max(S.night,S.rain*0.7)*0.85);
+  stationGlow.material.opacity=0.35+S.night*0.5;
+
+  // задник: облака подкрашиваются тем же светом
+  cloudMat.color.copy(cHor).lerp(new THREE.Color(0xFFFFFF), 0.25*(1-gloom));
+  cloudMat.opacity=0.28+0.32*(1-gloom);
+  waterMat.color.copy(cFog).lerp(WATER_DEEP, 0.62);
+
+  /* --- солнце ходит по кругу и следует за машиной (тени всегда рядом) --- */
+  const sa=phase*Math.PI*2;
+  const sunH=30+75*Math.max(0.14,Math.cos(sa));      // к ночи опускается к горизонту
+  sun.position.set(car.position.x+Math.cos(sa)*70, car.position.y+sunH, car.position.z+Math.sin(sa)*55);
+  sun.target.position.copy(car.position);
+
+  /* --- солнечные блики: экранный слой, без постобработки --- */
+  sunDir.copy(sun.position).sub(car.position).normalize();
+  {
+    const day=(1-S.night)*(1-S.rain*0.85);
+    let vis=0, sx=0, sy=0;
+    if(day>0.03){
+      camera.getWorldDirection(camFwd);
+      const facing=camFwd.dot(sunDir);
+      if(facing>0.12){
+        sunScreen.copy(camera.position).addScaledVector(sunDir,900).project(camera);
+        sx=(sunScreen.x*0.5+0.5)*innerWidth;
+        sy=(-sunScreen.y*0.5+0.5)*innerHeight;
+        vis=day*Math.pow(clamp((facing-0.12)/0.88,0,1),1.6);
+      }
+    }
+    flare.el.style.opacity=vis.toFixed(3);
+    if(vis>0.01){
+      const cx=innerWidth/2, cy=innerHeight/2;
+      flare.parts.forEach((p,i)=>{
+        const k=flare.k[i];
+        p.style.left=(cx+(sx-cx)*k)+'px';
+        p.style.top =(cy+(sy-cy)*k)+'px';
+      });
+    }
+  }
+
+  /* --- камера от третьего лица --- */
+  const back=new THREE.Vector3(-Math.sin(S.yaw),0,-Math.cos(S.yaw));
+  const dist=11.5+Math.abs(S.speed)*0.13;
+  const want=new THREE.Vector3(
+    car.position.x+back.x*dist, car.position.y+5.0+Math.abs(S.speed)*0.02, car.position.z+back.z*dist);
+  want.y=Math.max(want.y, heightAt(want.x,want.z)+2.6);
+  camPos.lerp(want, 1-Math.exp(-6.5*dt));
+  if(S.shake>0){
+    S.shake=Math.max(0,S.shake-dt*2.2);
+    camPos.x+=(Math.random()-.5)*S.shake; camPos.y+=(Math.random()-.5)*S.shake;
+  }
+  camera.position.copy(camPos);
+  // FOV расширяется со скоростью — самый дешёвый способ передать скорость
+  const wantFov = 58 + Math.min(Math.abs(S.speed)/MAX_SPEED,1)*16;
+  if(Math.abs(camera.fov-wantFov)>0.05){
+    camera.fov = lerp(camera.fov, wantFov, 1-Math.exp(-3.5*dt));
+    camera.updateProjectionMatrix();
+  }
+  camAim.lerp(new THREE.Vector3(car.position.x+Math.sin(S.yaw)*7, car.position.y+2.1, car.position.z+Math.cos(S.yaw)*7),
+    1-Math.exp(-7*dt));
+  camera.lookAt(camAim);
+  sky.position.copy(camera.position); stars.position.copy(camera.position);
+  backdrop.position.set(camera.position.x, 0, camera.position.z);
+  // облака медленно плывут и заворачиваются
+  clouds.forEach((c,i)=>{
+    c.position.x += (5+i*0.6)*dt;
+    if(c.position.x>1000) c.position.x=-1000;
+  });
+  // диски светил на своих направлениях
+  sunDisc.position.copy(sunDir).multiplyScalar(1150);
+  sunDisc.position.y=Math.max(sunDisc.position.y,-60);
+  sunDisc.material.opacity=clamp(1-S.night*1.3,0,1)*(1-S.rain*0.8);
+  sunDisc.material.color.copy(DAY.sun).lerp(DUSK.sun, dusk);
+  moonDisc.position.copy(sunDir).multiplyScalar(-1150); moonDisc.position.y=Math.abs(moonDisc.position.y)*0.7+180;
+  moonDisc.material.opacity=S.night*(1-S.rain*0.9)*0.9;
+
+  updateHud(!onRoad(S.x,S.z));
+  drawMinimap();
+  renderer.render(scene,camera);
+}
+
+/* --- конец игры --- */
+function finish(win){
+  Sfx.mute();
+  if(win){ Sfx.refuelDone(); Sfx.tone(523,1046,1.2,'triangle',.18,.2); }
+  const left=Math.round(Math.hypot(stationPos.x-S.x, stationPos.z-S.z));
+  let top=[];
+  try{
+    top=JSON.parse(localStorage.getItem('nb_top')||'[]');
+    if(!Array.isArray(top)) top=[];
+    top.push(S.score);
+    top.sort((a,b)=>b-a); top=top.slice(0,5);
+    localStorage.setItem('nb_top', JSON.stringify(top));
+  }catch(e){ top=[S.score]; }
+
+  $('over-title').innerHTML = win
+    ? 'ЗАДАНИЕ<em>ВЫПОЛНЕНО</em>'
+    : 'БЕНЗИН<em style="color:var(--red)">ЗАКОНЧИЛСЯ</em>';
+  $('over').classList.toggle('win', !!win);
+  $('r-az').textContent=S.found+' / '+GOAL;
+  $('r-score').textContent=S.score;
+  $('r-time').textContent=fmtTime(S.time);
+  $('r-dist').textContent=(S.dist/1000).toFixed(2)+' км';
+  $('r-combo').textContent='×'+S.maxCombo;
+  $('r-drift').textContent=S.bestDrift;
+  $('r-left').textContent=win ? '—' : left+' м до АЗС';
+  $('best').textContent='ЛУЧШИЕ РЕЗУЛЬТАТЫ\n'+
+    top.map((v,i)=>(i+1)+'.  '+v+(v===S.score?'   ← сейчас':'')).join('\n');
+  $('over').classList.remove('hidden');
+  setTimeout(()=>{ try{ $('again').focus(); }catch(e){} }, 30);
+}
+const gameOver = ()=>finish(false);
+
+/* --- ресайз --- */
+function resize(){
+  const w=innerWidth,h=innerHeight;
+  renderer.setSize(w,h,false);
+  camera.aspect=w/h; camera.updateProjectionMatrix();
+}
+addEventListener('resize',resize); resize();
+
+$('start').addEventListener('click',()=>{ Sfx.init(); reset(); });
+$('again').addEventListener('click',()=>{ reset(); });
+$('resume').addEventListener('click',()=>togglePause());
+$('o-shadow').addEventListener('click',()=>{ shadowsOn=!shadowsOn; applyQuality(); });
+$('o-quality').addEventListener('click',()=>{ hiQuality=!hiQuality; applyQuality(); resize(); });
+$('o-sound').addEventListener('click',()=>toggleSound());
+initTouch();
+applyQuality();
+
+placeStation(); placeCans();
+car.position.set(S.x,heightAt(S.x,S.z),S.z);
+camPos.set(0,10,-16);
+tick();
+</script>
+</body>
+</html>
