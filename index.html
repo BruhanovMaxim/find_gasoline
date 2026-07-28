@@ -1307,11 +1307,12 @@ function spawnSparks(x,y,z,n){
 
 /* --- дождь: короткие штрихи, наклон зависит от ветра и скорости машины --- */
 const RAIN_N=1200, RAIN_BOX=95, RAIN_TOP=48;
+const RAIN_LEN=0.25;                               // множитель длины хвоста капли
 const rainPos=new Float32Array(RAIN_N*6);          // по две вершины на каплю
 const rainDrops=[];
 for(let i=0;i<RAIN_N;i++) rainDrops.push({
   x:(Math.random()-.5)*RAIN_BOX, y:Math.random()*RAIN_TOP, z:(Math.random()-.5)*RAIN_BOX,
-  v:46+Math.random()*26, len:0.9+Math.random()*1.5
+  v:46+Math.random()*26, len:(0.9+Math.random()*1.5)*RAIN_LEN
 });
 const rainGeo=new THREE.BufferGeometry();
 rainGeo.setAttribute('position',new THREE.BufferAttribute(rainPos,3));
@@ -1672,12 +1673,12 @@ function reset(){
    7b. ПЕРКИ — выбор после каждой заправки
    ============================================================ */
 const PERKS = [
-  {t:'БОЛЬШЕ БАК',       d:'+6 литров к объёму бака. Заливается сразу.',
-   f:()=>{ S.tankMax+=6; S.fuel=S.tankMax; }},
-  {t:'ЭКОНОМИЧНЫЙ ХОД',  d:'−12% расхода топлива до конца партии.',
-   f:()=>{ S.eco*=0.88; }},
-  {t:'МОЩНЫЙ ДЕТЕКТОР',  d:'+70 м к радиусу захвата АЗС.',
-   f:()=>{ S.lockR+=70; }},
+  {t:'БОЛЬШЕ БАК',       d:'+15 литров к объёму бака. Заливается сразу.',
+   f:()=>{ S.tankMax+=15; S.fuel=S.tankMax; }},
+  {t:'ЭКОНОМИЧНЫЙ ХОД',  d:'−20% расхода топлива до конца партии.',
+   f:()=>{ S.eco*=0.80; }},
+  {t:'МОЩНЫЙ ДЕТЕКТОР',  d:'+150 м к радиусу захвата АЗС.',
+   f:()=>{ S.lockR+=150; }},
   {t:'РЕМКОМПЛЕКТ',      d:'Один раз автоматически заделает пробитый бак.',
    f:()=>{ S.kits++; }},
   {t:'НОЧНАЯ СМЕНА',     d:'+15 секунд к работе каждой следующей АЗС.',
@@ -1689,8 +1690,8 @@ const PERKS = [
   {t:'КАНИСТРЫ',         d:'+2 канистры на маршруте к следующей АЗС.',
    f:()=>{ S.canCount=Math.min(cans.length,S.canCount+2); placeCans(); },
    maxed:()=>S.canCount>=cans.length},
-  {t:'ФОРСАЖ',           d:'+12% к максимальной скорости.',
-   f:()=>{ S.spd*=1.12; }}
+  {t:'ФОРСАЖ',           d:'+20% к максимальной скорости.',
+   f:()=>{ S.spd*=1.20; }}
 ];
 
 function showPerks(){
