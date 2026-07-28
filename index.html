@@ -593,8 +593,13 @@ const DAY = { sky:new THREE.Color(0x7FB4E8), hor:new THREE.Color(0xCFE0EA), fog:
               sun:new THREE.Color(0xFFF1D6), amb:new THREE.Color(0x8AA3C0) };
 const DUSK= { sky:new THREE.Color(0x24406F), hor:new THREE.Color(0xFF9B58), fog:new THREE.Color(0xE68B57),
               sun:new THREE.Color(0xFF8E4A), amb:new THREE.Color(0x8A5F6B) };
+/* amb уходит только в подсветку поверхностей (hemi.color), к небу и туману
+   отношения не имеет — поэтому осветление ночного amb делает читаемыми землю
+   и дорогу, оставляя небо таким же чёрным. Прежний 0x1B2436 при интенсивности
+   0.28 давал на грунт около 3% яркости: покрытие сливалось в сплошную темноту
+   везде, куда не доставали фары. */
 const NIGHT={ sky:new THREE.Color(0x05070F), hor:new THREE.Color(0x141C2B), fog:new THREE.Color(0x101724),
-              sun:new THREE.Color(0x2A3F66), amb:new THREE.Color(0x1B2436) };
+              sun:new THREE.Color(0x2A3F66), amb:new THREE.Color(0x39485F) };
 const cSky=new THREE.Color(), cHor=new THREE.Color(), cFog=new THREE.Color();
 // цвет = день→ночь, а на переходе подмешивается закатная палитра
 function palette(out, key, t, dusk){
@@ -611,34 +616,77 @@ const sky = new THREE.Mesh(
   new THREE.ShaderMaterial({
     side:THREE.BackSide, depthWrite:false, fog:false,
     uniforms:{ top:{value:DAY.sky.clone()}, bottom:{value:DAY.hor.clone()},
-               exposure:{value:renderer.toneMappingExposure} },
-    vertexShader:`varying vec3 vW; void main(){ vW=(modelMatrix*vec4(position,1.)).xyz;
+               sunCol:{value:DAY.sun.clone()}, sunDir:{value:new THREE.Vector3(0,1,0)},
+               glow:{value:1}, exposure:{value:renderer.toneMappingExposure} },
+    /* Сфера ездит вместе с камерой, локальный центр всегда под глазом — значит
+       направление взгляда это нормаль от position, без модельной матрицы.
+       Через world-позицию оно бралось со смещением на координаты камеры, и у
+       края карты (±1152 при радиусе 1300) горизонт заметно перекашивало. */
+    vertexShader:`varying vec3 vDir; void main(){ vDir=position;
       gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
-    fragmentShader:`uniform vec3 top; uniform vec3 bottom; uniform float exposure; varying vec3 vW;
+    /* Ореол вокруг солнца: узкая часть — свечение у диска, широкая — засветка
+       полнеба. Обе прибавляются ДО aces(), иначе тон горизонта разъезжается
+       с туманом, который тональную компрессию проходит уже в рендерере. */
+    fragmentShader:`uniform vec3 top; uniform vec3 bottom; uniform vec3 sunCol;
+      uniform vec3 sunDir; uniform float glow; uniform float exposure; varying vec3 vDir;
       vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
-      void main(){ float h=max(normalize(vW).y,0.0);
+      void main(){ vec3 d=normalize(vDir); float h=max(d.y,0.0);
         vec3 c=mix(bottom,top,pow(h,0.55));
+        float s=max(dot(d,sunDir),0.0);
+        c+=sunCol*glow*(pow(s,64.0)*0.55+pow(s,7.0)*0.18);
         gl_FragColor=vec4(aces(c*exposure),1.0); }`
   })
 );
 sky.frustumCulled = false; scene.add(sky);
 
 // звёзды (проявляются ночью)
+const STARS=600;
 const starGeo = new THREE.BufferGeometry();
-{ const p=[]; for(let i=0;i<600;i++){ const th=rnd()*Math.PI*2, ph=Math.acos(rnd()*.85+.05), r=1150;
-    p.push(Math.sin(ph)*Math.cos(th)*r, Math.cos(ph)*r, Math.sin(ph)*Math.sin(th)*r); }
-  starGeo.setAttribute('position', new THREE.Float32BufferAttribute(p,3)); }
-const starMat = new THREE.PointsMaterial({color:0xE8F0FF,size:2.6,sizeAttenuation:false,transparent:true,opacity:0,fog:false});
+// у каждой звезды своя фаза, свой темп и своя базовая яркость — иначе всё небо
+// мигает в такт и это сразу читается как эффект, а не как звёзды
+const starPhase=new Float32Array(STARS), starRate=new Float32Array(STARS), starBase=new Float32Array(STARS);
+let starCol;
+{ const p=[];
+  /* Отдельный ГПСЧ: rnd() здесь уже вызывается, и лишние обращения к нему
+     сдвинули бы общий поток — весь мир (деревья, дома, фонари) сгенерировался бы
+     заново по другой раскладке. Своя последовательность ничего не задевает. */
+  const srnd=mulberry32(9137);
+  for(let i=0;i<STARS;i++){ const th=rnd()*Math.PI*2, ph=Math.acos(rnd()*.85+.05), r=1150;
+    p.push(Math.sin(ph)*Math.cos(th)*r, Math.cos(ph)*r, Math.sin(ph)*Math.sin(th)*r);
+    starPhase[i]=srnd()*6.283; starRate[i]=0.55+srnd()*1.75; starBase[i]=0.80+srnd()*0.40; }
+  starGeo.setAttribute('position', new THREE.Float32BufferAttribute(p,3));
+  starCol=new Float32Array(STARS*3).fill(1);
+  starGeo.setAttribute('color', new THREE.BufferAttribute(starCol,3)); }
+// vertexColors домножает цвет материала на цвет вершины — мерцание идёт множителем,
+// а общий тон и прозрачность остаются на материале, как было
+const starMat = new THREE.PointsMaterial({color:0xE8F0FF,size:2.6,sizeAttenuation:false,
+  transparent:true,opacity:0,fog:false,vertexColors:true});
 const stars = new THREE.Points(starGeo, starMat); stars.frustumCulled=false; scene.add(stars);
 
-const hemi = new THREE.HemisphereLight(0x9FC0E0, 0x4C6136, 1.15); scene.add(hemi);
-const sun  = new THREE.DirectionalLight(0xFFF1D6, 2.1);
+/* Ключ и заполнение днём — 2.8 к 0.7, то есть 4:1.
+   При прежних 2.1 к 1.15 (меньше двух) затенённый бок был почти той же светлоты,
+   что освещённый: ясный полдень выглядел как ровная облачность. Ночные значения
+   у обоих источников те же, что были, — правится только дневной конец шкалы,
+   парой с lerp() в tick(). */
+const hemi = new THREE.HemisphereLight(0x9FC0E0, 0x4C6136, 0.7); scene.add(hemi);
+const sun  = new THREE.DirectionalLight(0xFFF1D6, 2.8);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048,2048);
 sun.shadow.camera.near = 1; sun.shadow.camera.far = 260;
 sun.shadow.camera.left=-72; sun.shadow.camera.right=72;
 sun.shadow.camera.top=72;  sun.shadow.camera.bottom=-72;
-sun.shadow.bias = -0.0012;
+/* Константный bias сдвигает тень для всей сцены одинаково, поэтому его хватает
+   ровно до тех пор, пока не начнёт отрывать тень от подошвы объекта. normalBias
+   отодвигает точку выборки вдоль нормали — величина сдвига зависит от наклона
+   грани, так что рябь на пологом рельефе уходит без потери контакта. Теперь,
+   когда тени стали глубже, отрыв было бы видно. */
+sun.shadow.bias = -0.0005;
+sun.shadow.normalBias = 0.035;
+/* Плотность падающей тени — от столбов, машины, деревьев, домов, всего.
+   В шейдере это mix(1.0, shadow, intensity), то есть 0.5 — ровно вдвое светлее.
+   Отдельный параметр удобнее правки света: сила солнца и глубина тени
+   развязаны, контраст 4:1 остаётся, а тени перестают быть провалами. */
+sun.shadow.intensity = 0.5;
 scene.add(sun); scene.add(sun.target);
 
 /* ============================================================
@@ -806,6 +854,7 @@ function instanced(geo, mat, list, shadow=true){
 const lampHeads = [];  // для ночной подсветки
 const spots = [];      // контактные тени-пятна под объектами
 let lampMat = null;    // материал плафонов — светится ночью
+let winMat  = null;    // материал окон, которые зажигаются к ночи
 const LINES = [];      // координаты линий дорог
 for(let f=-MAP; f<=MAP; f+=ROAD_STEP) LINES.push(f);
 const anyLine = ()=>LINES[Math.floor(rnd()*LINES.length)];
@@ -826,7 +875,8 @@ function radialTexture(inner, outer, power){
 const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
 {
   const trunks=[], crowns=[], rocks=[], walls=[], roofs=[], bushes=[],
-        poles=[], heads=[], signPoles=[], signPlates=[];
+        poles=[], heads=[], signPoles=[], signPlates=[],
+        winLit=[], winDark=[], doors=[];
 
   // деревья (вне дорог)
   for(let i=0;i<2600;i++){
@@ -849,14 +899,57 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
     addCollider({x,z,r:s*.9});
   }
   // дома: деревни вокруг перекрёстков + одиночные хутора вдоль дорог
+  /* Ставни зажигаются не у всех окон. Выбор идёт хешем от координат, а не через
+     rnd(): лишний вызов сдвинул бы поток ГПСЧ и перетасовал весь мир после домов. */
+  const hash01=(a,b)=>((((a*73856093)^(b*19349663))>>>0)%1000)/1000;
   const house=(x,z,vertical)=>{
     if(Math.abs(x)>MAP-30||Math.abs(z)>MAP-30) return;
     if(onPavement(x,z,ROAD_HALF+7)||inLake(x,z)) return;
-    const y=heightAt(x,z), w=6+rnd()*5, ry=vertical?0:Math.PI/2;
-    walls.push({x,y:y+2.2,z,s:w/6,sy:1,ry});
-    roofs.push({x,y:y+4.35+1.3,z,s:w/6*1.15,sy:1,ry:ry+Math.PI/4});
-    spots.push({x,y:y+0.07,z,s:w*1.7,rx:-Math.PI/2});
+    const w=6+rnd()*5, ry=vertical?0:Math.PI/2, s=w/6;
+    // коробка 6×7 в плане; поворот бывает только на 0 или 90°, поэтому
+    // мировые полуразмеры берутся перестановкой, без тригонометрии
+    const halfX=(vertical?3:3.5)*s, halfZ=(vertical?3.5:3)*s;
+    /* Дом занимает до 11×13 юнитов — больше ячейки рельефа (12), а heightAt()
+       возвращает высоту одной точки. На склоне углы уходят ниже центра, и дом
+       висит над землёй. Сажаем по минимуму высоты в пределах пятна: нижний угол
+       касается земли, верхний уходит в грунт и читается как фундамент. */
+    let base=Infinity;
+    for(let a=-1;a<=1;a++) for(let b=-1;b<=1;b++)
+      base=Math.min(base, heightAt(x+a*halfX, z+b*halfZ));
+    walls.push({x,y:base+2.2,z,s,sy:1,ry});
+    roofs.push({x,y:base+4.35+1.3,z,s:s*1.15,sy:1,ry:ry+Math.PI/4});
+    // пятно остаётся на высоте земли под центром — это декаль на рельефе, не на доме
+    spots.push({x,y:heightAt(x,z)+0.07,z,s:w*1.7,rx:-Math.PI/2});
     addCollider({x,z,r:w*.62});
+
+    /* Фасад разворачивается к ближайшей дороге: ближе та ось, у которой меньше
+       расстояние до линии сетки. Дверь ставится только на эту грань. */
+    const toX=Math.round(x/ROAD_STEP)*ROAD_STEP-x, toZ=Math.round(z/ROAD_STEP)*ROAD_STEP-z;
+    const frontX=Math.abs(toX)<Math.abs(toZ) ? (Math.sign(toX)||1) : 0;
+    const frontZ=frontX ? 0 : (Math.sign(toZ)||1);
+    /* Грани коробки: [нормаль x, нормаль z, вынос до плоскости, полуширина грани,
+       разворот накладки]. Накладка сделана тонкой пластиной, смотрящей в +z,
+       поворот вокруг Y уводит её местный +z в нужную сторону. */
+    const faces=[[1,0,halfX,halfZ,Math.PI/2], [-1,0,halfX,halfZ,-Math.PI/2],
+                 [0,1,halfZ,halfX,0],         [0,-1,halfZ,halfX,Math.PI]];
+    for(const [nx,nz,out,tanHalf,ang] of faces){
+      const ox=x+nx*(out+0.06), oz=z+nz*(out+0.06);
+      const front = nx===frontX && nz===frontZ;
+      /* Основание взято по низшей точке пятна, поэтому с нагорной стороны стена
+         частично в грунте — там накладки надо поднять до местной земли, иначе
+         дверь закапывается (у 8% фасадов больше чем наполовину). Потолки разные:
+         дверь упирается в верх стены на 2.3, окно — уже на 1.05. */
+      const rise=heightAt(ox,oz)-base;
+      if(front) doors.push({x:ox,y:base+clamp(rise,0,2.0)+1.05,z:oz,ry:ang,s:1});
+      const winY=base+clamp(rise,0,1.0)+2.9;
+      // на фасаде окна разведены шире обычного — между ними встаёт дверь
+      const slots = front ? [-0.62,0.62] : (tanHalf>3.2 ? [-0.5,0.5] : [0]);
+      for(const t of slots){
+        const px = nx ? ox : ox+t*tanHalf;
+        const pz = nx ? oz+t*tanHalf : oz;
+        (hash01(px,pz)<0.55?winLit:winDark).push({x:px,y:winY,z:pz,ry:ang,s:1});
+      }
+    }
   };
   for(let v=0;v<26;v++){                       // деревни
     const cx=anyLine(), cz=anyLine();
@@ -934,6 +1027,13 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
   instanced(new THREE.DodecahedronGeometry(1,0),     M(0x8C8A85), rocks);
   instanced(new THREE.BoxGeometry(6,4.4,7),          M(0xC7B49A), walls);
   instanced(new THREE.ConeGeometry(5.2,2.6,4),       M(0x8E4A3C), roofs);
+  /* Окна и двери — накладки постоянного размера: они не должны расти вместе
+     с домом, иначе у большой избы получается витрина. Тени выключены, как у
+     знаков и плафонов: пластины лежат заподлицо, силуэт даёт сама стена. */
+  winMat = M(0x2A3A4A,0x000000);
+  instanced(new THREE.BoxGeometry(.9,.9,.12),        winMat,        winLit,  false);
+  instanced(new THREE.BoxGeometry(.9,.9,.12),        M(0x1E2A36),   winDark, false);
+  instanced(new THREE.BoxGeometry(1.1,2.1,.12),      M(0x5A3B27),   doors,   false);
   const bushMesh=instanced(shaded(new THREE.IcosahedronGeometry(1,0),0x2A4520), Mv(0x3E6B34), bushes);
   {
     const bc=new THREE.Color();
@@ -952,7 +1052,9 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
 
 /* --- контактные тени под объектами (одна отрисовка на всё) --- */
 instanced(new THREE.PlaneGeometry(1,1),
-  new THREE.MeshBasicMaterial({map:spotTex,color:0x0C1409,transparent:true,opacity:.42,
+  // заодно контактные пятна: это тоже тени, и оставь их прежними — под деревьями
+  // и домами остались бы чёрные блины при осветлённой падающей тени
+  new THREE.MeshBasicMaterial({map:spotTex,color:0x0C1409,transparent:true,opacity:.21,
     depthWrite:false,polygonOffset:true,polygonOffsetFactor:-3,polygonOffsetUnits:-3}),
   spots, false);
 
@@ -1000,9 +1102,17 @@ barriers.count = 0;
 const car = new THREE.Group(); car.rotation.order='YXZ'; scene.add(car);
 const wheels=[], headGlow=[];
 {
-  const paint=new THREE.MeshLambertMaterial({color:0xE0A423,flatShading:true});
+  /* Кузов и стекло — Phong, всё остальное в игре остаётся Lambert.
+     Ламберт не умеет отражать солнце вовсе, из-за чего машина днём выглядела
+     крашеным картоном. Грани у кузова плоские, нормаль по грани постоянна,
+     но вектор до камеры внутри грани меняется — блик получается градиентом,
+     а не ровной заливкой, и ползёт по борту на поворотах.
+     Только эти два материала: Phong на всю сцену — уже разговор про кадры. */
+  const paint=new THREE.MeshPhongMaterial({color:0xE0A423,flatShading:true,
+    shininess:34,specular:0x554F42});
   const dark =new THREE.MeshLambertMaterial({color:0x23272C,flatShading:true});
-  const glass=new THREE.MeshLambertMaterial({color:0x2E4756,flatShading:true});
+  const glass=new THREE.MeshPhongMaterial({color:0x2E4756,flatShading:true,
+    shininess:95,specular:0x8A99A8});
 
   const body=new THREE.Mesh(new THREE.BoxGeometry(2.0,.7,4.3),paint); body.position.y=.85;
   const cab =new THREE.Mesh(new THREE.BoxGeometry(1.72,.62,2.0),glass); cab.position.set(0,1.42,-.15);
@@ -2046,14 +2156,34 @@ function tick(){
   scene.fog.color.copy(cFog);
   scene.fog.far = VIEW*(1-S.rain*0.38);
   renderer.setClearColor(cFog);
-  sun.intensity=lerp(2.1,0.28,gloom)*(1+dusk*0.25);
+  sun.intensity=lerp(2.8,0.34,gloom)*(1+dusk*0.25);
   palette(sun.color,'sun',gloom,dusk);
-  hemi.intensity=lerp(1.15,0.28,gloom);
+  /* Дождь гасит солнце через gloom, но заполнение при этом придерживается:
+     пасмурно — это рассеянный свет, а не темнота, иначе ливень днём уходит в ночь.
+     Прибавка 0.18, а не больше: ночной конец шкалы поднят до 0.42, и при
+     прежних 0.30 дневной ливень получал заполнения больше, чем ясный полдень. */
+  hemi.intensity=lerp(0.7,0.42,gloom)+S.rain*0.18*(1-S.night);
   palette(hemi.color,'amb',gloom,dusk);
   starMat.opacity=S.night*(1-S.rain)*0.9;
+  /* Мерцание: две синусоиды несовпадающих периодов, поэтому рисунок не повторяется
+     на глаз и не выглядит пульсацией. Размах ±15% от базовой яркости — «совсем
+     немного». Колебание центрировано на единице, а базовые яркости разбросаны
+     вокруг неё: среднее по небу остаётся прежним, иначе мерцание заодно приглушило
+     бы звёзды на четверть. Считаем только когда их видно: днём это 600 холостых
+     синусов на кадр. */
+  if(starMat.opacity>0.01){
+    for(let i=0;i<STARS;i++){
+      const ph=starPhase[i], r=starRate[i];
+      const f=starBase[i]*(1+0.15*(0.62*Math.sin(t*r+ph)+0.38*Math.sin(t*r*1.7+ph*2.3)));
+      starCol[i*3]=starCol[i*3+1]=starCol[i*3+2]=f;
+    }
+    starGeo.attributes.color.needsUpdate=true;
+  }
   car.userData.beams.forEach(b=>b.intensity=Math.max(S.night,S.rain*0.7)*260);
   lampEmissive=Math.max(S.night,S.rain*0.8);
   if(lampMat) lampMat.emissive.setRGB(lampEmissive*0.95, lampEmissive*0.8, lampEmissive*0.45);
+  // окна теплее и слабее уличных плафонов — свет из комнаты, а не фонарь
+  if(winMat)  winMat.emissive.setRGB(lampEmissive*0.80, lampEmissive*0.55, lampEmissive*0.22);
   lampGlow.material.opacity=lampEmissive*0.55;
   headGlow.forEach(h=>h.material.opacity=Math.max(S.night,S.rain*0.7)*0.85);
   stationGlow.material.opacity=0.35+S.night*0.5;
@@ -2071,6 +2201,11 @@ function tick(){
 
   /* --- солнечные блики: экранный слой, без постобработки --- */
   sunDir.copy(sun.position).sub(car.position).normalize();
+  // ореол неба питается тем же направлением, поэтому обновляется здесь,
+  // а не в блоке палитры выше: там sun.position ещё прошлого кадра
+  sky.material.uniforms.sunDir.value.copy(sunDir);
+  sky.material.uniforms.sunCol.value.copy(sun.color);
+  sky.material.uniforms.glow.value=(1-S.night)*(1-S.rain*0.85);
   {
     const day=(1-S.night)*(1-S.rain*0.85);
     let vis=0, sx=0, sy=0;
