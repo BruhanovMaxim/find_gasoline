@@ -104,7 +104,13 @@ html,body{height:100%;overflow:hidden;background:var(--asphalt);color:var(--crea
 .screen{position:fixed;inset:0;z-index:20;display:grid;place-items:center;
   grid-template-columns:minmax(0,1fr);   /* иначе длинные строки не переносятся, а вылезают за экран */
   background:radial-gradient(circle at 50% 40%,rgba(20,26,34,.92),rgba(5,7,10,.97));
-  padding:24px;text-align:center;overflow-y:auto}
+  padding:24px;text-align:center;overflow-y:auto;
+  /* overflow-y:auto делает контейнер скроллящимся по обеим осям: расходящиеся
+     кольца ссылки на чат попадают в область прокрутки, внизу выскакивает
+     горизонтальная полоса и центровка дёргается в такт пульсации.
+     clip убирает полосу, не создавая скролл-контейнер; hidden — запасной
+     вариант для браузеров без поддержки clip, порядок важен */
+  overflow-x:hidden;overflow-x:clip}
 .screen>div{max-width:760px}
 .hint-touch{display:none}
 .screen.hidden{display:none}
@@ -125,6 +131,24 @@ button:hover,button:focus-visible{transform:translateY(-2px);box-shadow:0 8px 26
 #result span{color:rgba(237,230,216,.5);text-transform:uppercase;align-self:center}
 #best{margin-top:16px;font-size:11px;letter-spacing:.14em;color:rgba(237,230,216,.4);
   line-height:2;white-space:pre-line}
+
+/* Ссылка на чат — правый верх главного экрана.
+   Кольца лежат отдельными <i> под надписью: псевдоэлементов хватило бы на два,
+   а с тремя пульсация читается как непрерывная волна, а не как мигание. */
+#chatlink{position:absolute;top:68px;right:68px;z-index:2;pointer-events:auto;
+  display:inline-flex;align-items:center;text-decoration:none;
+  font-family:var(--display);font-size:14px;font-weight:600;letter-spacing:.16em;
+  color:var(--amber);padding:9px 15px;border:1px solid var(--stroke);border-radius:3px;
+  background:rgba(9,12,17,.55);transition:border-color .14s,transform .14s,box-shadow .14s}
+#chatlink span{position:relative;z-index:1}
+#chatlink:hover,#chatlink:focus-visible{border-color:var(--amber);transform:translateY(-2px);
+  box-shadow:0 6px 20px rgba(255,176,32,.28);outline:none}
+#chatlink i{position:absolute;inset:0;border-radius:3px;border:1px solid var(--amber);
+  opacity:0;pointer-events:none;animation:chatpulse 2.7s ease-out infinite}
+#chatlink i:nth-of-type(2){animation-delay:.9s}
+#chatlink i:nth-of-type(3){animation-delay:1.8s}
+@keyframes chatpulse{0%{opacity:.55;transform:scale(1)}100%{opacity:0;transform:scale(1.42)}}
+body.touch #chatlink{top:10px;right:10px;font-size:12px;padding:7px 11px}
 
 /* Плёнка воды на камере во время дождя */
 #wetlens{position:fixed;inset:0;pointer-events:none;z-index:7;opacity:0;
@@ -344,6 +368,9 @@ body.touch .opt{font-size:11px;padding:11px 14px}
 </div>
 
 <div id="menu" class="screen">
+  <a id="chatlink" href="https://t.me/find_gasoline" target="_blank" rel="noopener noreferrer">
+    <i></i><i></i><i></i><span>GO В ЧАТ</span>
+  </a>
   <div>
     <h1>НАЙДИ<em>БЕНЗИН</em></h1>
     <p>
