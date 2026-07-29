@@ -470,28 +470,19 @@ for(let j=0;j<=SEG;j++)
     H[j*(SEG+1)+i] = baseHeight(-MAP+i*CELL, -MAP+j*CELL);
 const hIdx = (i,j)=>H[clamp(j,0,SEG)*(SEG+1)+clamp(i,0,SEG)];
 
-/* Озёра: выкапываем чаши прямо в сетке высот, до того как из неё соберут меш */
-const LAKES=[];
-{
-  for(let a=0; a<60 && LAKES.length<4; a++){
-    const x=(rnd()*2-1)*(MAP-280), z=(rnd()*2-1)*(MAP-280);
-    if(Math.min(gridDist(x),gridDist(z))<95) continue;                 // подальше от дорог
-    if(LAKES.some(l=>(l.x-x)**2+(l.z-z)**2 < 520*520)) continue;
-    const r=70+rnd()*60;
-    let sum=0;
-    for(let k=0;k<12;k++){ const ang=k/12*6.283; sum+=baseHeight(x+Math.cos(ang)*r*1.3, z+Math.sin(ang)*r*1.3); }
-    LAKES.push({x,z,r,base:sum/12});
-  }
-  for(let j=0;j<=SEG;j++) for(let i=0;i<=SEG;i++){
-    const x=-MAP+i*CELL, z=-MAP+j*CELL, k=j*(SEG+1)+i;
-    for(const l of LAKES){
-      const d=Math.hypot(x-l.x,z-l.z);
-      if(d>l.r*1.3) continue;
-      H[k]=lerp(H[k], l.base-8, 1-smooth(l.r*0.2, l.r*1.3, d));
-    }
-  }
-}
-const inLake=(x,z)=>LAKES.some(l=>(l.x-x)**2+(l.z-z)**2 < (l.r*0.98)**2);
+/* Здесь были озёра — вырезаны как мёртвый код.
+   Точка бралась случайно и отбрасывалась, если ближе 95 юнитов к линии дорог,
+   но gridDist() по построению не бывает больше 96 (шаг сетки 192). То есть обе
+   координаты должны были попасть в двухъюнитовую полосу из ста девяноста двух:
+   примерно один шанс из девяти тысяч на попытку, шестьдесят попыток — меньше
+   процента на весь прогон. При сиде 20260727 не выпадало ни одного озера, и
+   вместе с ними мертвы были меши воды, вязкая физика и брызги.
+
+   Мир детерминирован потоком ГПСЧ: каждая из шестидесяти попыток тратила два
+   вызова rnd() на координаты (до третьего, на радиус, дело не доходило ни разу).
+   Поэтому поток надо промотать ровно на 120 вызовов — иначе деревья, дома,
+   фонари и знаки сгенерируются по совершенно другой раскладке. */
+for(let a=0;a<120;a++) rnd();
 
 // Высота поверхности в точке — интерполяция внутри того же треугольника,
 // которым рельеф разбит в геометрии (квад делится диагональю a-c).
@@ -510,9 +501,12 @@ function heightAt(x,z){
 const Sfx = {
   ready:false, ctx:null, noiseBuf:null,
   init(){
-    if(this.ready) return;
+    // контекст мог уйти в suspended (политика автовоспроизведения, уход вкладки
+    // в фон) — сам он оттуда не вернётся, и звука дальше не будет вовсе
+    if(this.ready){ if(this.ctx.state==='suspended') this.ctx.resume(); return; }
     const AC = window.AudioContext||window.webkitAudioContext; if(!AC) return;
     const ctx = this.ctx = new AC();
+    if(ctx.state==='suspended') ctx.resume();
     this.master = ctx.createGain(); this.master.gain.value = .5; this.master.connect(ctx.destination);
 
     // --- двигатель: две пилы + фильтр
@@ -671,7 +665,8 @@ let starCol;
     starPhase[i]=srnd()*6.283; starRate[i]=0.55+srnd()*1.75; starBase[i]=0.80+srnd()*0.40; }
   starGeo.setAttribute('position', new THREE.Float32BufferAttribute(p,3));
   starCol=new Float32Array(STARS*3).fill(1);
-  starGeo.setAttribute('color', new THREE.BufferAttribute(starCol,3)); }
+  starGeo.setAttribute('color', new THREE.BufferAttribute(starCol,3));
+  starGeo.attributes.color.setUsage(THREE.DynamicDrawUsage); }   // мерцание правит его каждый кадр ночью
 // vertexColors домножает цвет материала на цвет вершины — мерцание идёт множителем,
 // а общий тон и прозрачность остаются на материале, как было
 const starMat = new THREE.PointsMaterial({color:0xE8F0FF,size:2.6,sizeAttenuation:false,
@@ -711,6 +706,7 @@ const backdrop = new THREE.Group(); scene.add(backdrop);
 
 // облачный слой
 const clouds=[];
+let cloudMat;                     // подкрашивается в цикле кадра вместе с горизонтом
 {
   const c=document.createElement('canvas'); c.width=c.height=256;
   const g=c.getContext('2d');
@@ -728,7 +724,7 @@ const clouds=[];
     m.position.set((Math.random()*2-1)*900, 210+Math.random()*90, (Math.random()*2-1)*900);
     m.frustumCulled=false; backdrop.add(m); clouds.push(m);
   }
-  var cloudMat=mat;
+  cloudMat=mat;
 }
 
 // диски солнца и луны
@@ -748,12 +744,28 @@ const wetMats = [];
 const wet = m => { wetMats.push({mat:m, base:m.color.clone()}); return m; };
 const colliders = [];                 // {x,z,r,idx} — idx только у барьеров
 const cellSize = 60, grid = new Map();
-const key = (cx,cz)=>cx+'|'+cz;
+/* Ключ клетки — число, а не строка: карта укладывается в ±20 клеток по каждой
+   оси, множитель 1024 с запасом разводит соседние индексы и убирает склейку
+   строки на каждом обращении к сетке. */
+const key = (cx,cz)=>cx*1024+cz;
 function addCollider(c){
   colliders.push(c);
   const k = key(Math.floor(c.x/cellSize), Math.floor(c.z/cellSize));
   if(!grid.has(k)) grid.set(k,[]);
   grid.get(k).push(c);
+}
+/* Обход коллайдеров рядом с точкой — девять клеток вокруг неё.
+   Самый широкий радиус проверки в игре это 20 (clearSpot), а клетка 60, поэтому
+   3×3 заведомо накрывает всё, что может пересечься: результат тот же, что при
+   переборе всех 2700 коллайдеров, только сравнений на два порядка меньше.
+   Возвращает true, как только fn(c) дала true — как Array.some(). */
+function nearColliders(x, z, fn){
+  const cx=Math.floor(x/cellSize), cz=Math.floor(z/cellSize);
+  for(let i=-1;i<=1;i++) for(let j=-1;j<=1;j++){
+    const arr=grid.get(key(cx+i,cz+j)); if(!arr) continue;
+    for(const c of arr) if(fn(c)) return true;
+  }
+  return false;
 }
 
 /* --- рельеф: собственная геометрия из сетки H --- */
@@ -782,15 +794,6 @@ function addCollider(c){
   ground.receiveShadow=true;
   world.add(ground);
 }
-
-/* --- вода в озёрах --- */
-const waterMat=new THREE.MeshBasicMaterial({color:0x2E6B7A,transparent:true,opacity:.78,depthWrite:false});
-const WATER_DEEP=new THREE.Color(0x12414F);
-LAKES.forEach(l=>{
-  const m=new THREE.Mesh(new THREE.CircleGeometry(l.r*1.04,30), waterMat);
-  m.rotation.x=-Math.PI/2; m.position.set(l.x, l.base-1.2, l.z);
-  world.add(m);
-});
 
 /* --- дороги: асфальт + гравийная кромка + краевая разметка --- */
 {
@@ -897,7 +900,6 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
   for(let i=0;i<2600;i++){
     const x=(rnd()*2-1)*MAP, z=(rnd()*2-1)*MAP;
     if(Math.min(gridDist(x),gridDist(z))<22) continue;
-    if(inLake(x,z)) continue;
     const y=heightAt(x,z), s=.8+rnd()*.9, ry=rnd()*6.28;
     trunks.push({x,y:y+1.5*s,z,s:s*.55,sy:s*3,ry});
     crowns.push({x,y:y+4.2*s,z,s:s*2.6,ry});
@@ -907,7 +909,7 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
   // камни
   for(let i=0;i<420;i++){
     const x=(rnd()*2-1)*MAP, z=(rnd()*2-1)*MAP;
-    if(onPavement(x,z,ROAD_HALF+9)||inLake(x,z)) continue;
+    if(onPavement(x,z,ROAD_HALF+9)) continue;
     const s=.7+rnd()*1.6;
     rocks.push({x,y:heightAt(x,z)+s*.45,z,s,ry:rnd()*6.28,rx:rnd()*.6});
     spots.push({x,y:heightAt(x,z)+0.07,z,s:s*2.2,rx:-Math.PI/2});
@@ -919,7 +921,7 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
   const hash01=(a,b)=>((((a*73856093)^(b*19349663))>>>0)%1000)/1000;
   const house=(x,z,vertical)=>{
     if(Math.abs(x)>MAP-30||Math.abs(z)>MAP-30) return;
-    if(onPavement(x,z,ROAD_HALF+7)||inLake(x,z)) return;
+    if(onPavement(x,z,ROAD_HALF+7)) return;
     const w=6+rnd()*5, ry=vertical?0:Math.PI/2, s=w/6;
     // коробка 6×7 в плане; поворот бывает только на 0 или 90°, поэтому
     // мировые полуразмеры берутся перестановкой, без тригонометрии
@@ -989,7 +991,7 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
     for(let k=0;k<n;k++){
       const x=cx+(rnd()*2-1)*15, z=cz+(rnd()*2-1)*15;
       if(Math.abs(x)>MAP||Math.abs(z)>MAP) continue;
-      if(onPavement(x,z,ROAD_HALF+7)||inLake(x,z)) continue;
+      if(onPavement(x,z,ROAD_HALF+7)) continue;
       const s=0.85+rnd()*1.15;
       bushes.push({x,y:heightAt(x,z)+s*0.46,z,s,sy:s*0.7,ry:rnd()*6.28});
       spots.push({x,y:heightAt(x,z)+0.07,z,s:s*2.1,rx:-Math.PI/2});
@@ -1046,8 +1048,9 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
      с домом, иначе у большой избы получается витрина. Тени выключены, как у
      знаков и плафонов: пластины лежат заподлицо, силуэт даёт сама стена. */
   winMat = M(0x2A3A4A,0x000000);
-  instanced(new THREE.BoxGeometry(.9,.9,.12),        winMat,        winLit,  false);
-  instanced(new THREE.BoxGeometry(.9,.9,.12),        M(0x1E2A36),   winDark, false);
+  const winGeo=new THREE.BoxGeometry(.9,.9,.12);     // одна на зажжённые и на тёмные
+  instanced(winGeo,                                  winMat,        winLit,  false);
+  instanced(winGeo,                                  M(0x1E2A36),   winDark, false);
   instanced(new THREE.BoxGeometry(1.1,2.1,.12),      M(0x5A3B27),   doors,   false);
   const bushMesh=instanced(shaded(new THREE.IcosahedronGeometry(1,0),0x2A4520), Mv(0x3E6B34), bushes);
   {
@@ -1114,6 +1117,13 @@ barriers.count = 0;
 /* ============================================================
    5. АВТОМОБИЛЬ
    ============================================================ */
+/* Геометрии, общие у машины игрока и у встречного трафика: раньше каждая
+   создавалась дважды одними и теми же числами. Форма от этого не меняется —
+   экономятся только буферы в памяти и в драйвере. */
+const WHEEL_GEO=new THREE.CylinderGeometry(.45,.45,.34,10); WHEEL_GEO.rotateZ(Math.PI/2);
+const HEAD_GEO =new THREE.BoxGeometry(.42,.2,.12);          // фара
+const TAIL_GEO =new THREE.BoxGeometry(.5,.08,.1);           // стоп-сигнал
+
 const car = new THREE.Group(); car.rotation.order='YXZ'; scene.add(car);
 const wheels=[], headGlow=[];
 {
@@ -1134,9 +1144,8 @@ const wheels=[], headGlow=[];
   const nose=new THREE.Mesh(new THREE.BoxGeometry(1.9,.34,.9),paint); nose.position.set(0,.68,2.1);
   [body,cab,nose].forEach(m=>{m.castShadow=true;car.add(m);});
 
-  const wg=new THREE.CylinderGeometry(.45,.45,.34,10); wg.rotateZ(Math.PI/2);
   [[-.95,-1.45],[.95,-1.45],[-.95,1.45],[.95,1.45]].forEach(([x,z],i)=>{
-    const w=new THREE.Mesh(wg,dark); w.position.set(x,.48,z); w.rotation.order='YXZ';
+    const w=new THREE.Mesh(WHEEL_GEO,dark); w.position.set(x,.48,z); w.rotation.order='YXZ';
     w.castShadow=true; w.userData.front = i>1; car.add(w); wheels.push(w);
   });
 
@@ -1144,14 +1153,13 @@ const wheels=[], headGlow=[];
   const hl=new THREE.MeshBasicMaterial({color:0xFFF0C0});
   const tl=new THREE.MeshBasicMaterial({color:0x8E1B12});
   [[-.62,2.5],[.62,2.5]].forEach(([x,z])=>{
-    const m=new THREE.Mesh(new THREE.BoxGeometry(.42,.2,.12),hl); m.position.set(x,.8,z); car.add(m);
+    const m=new THREE.Mesh(HEAD_GEO,hl); m.position.set(x,.8,z); car.add(m);
   });
   // стопы: две узкие полосы по краям кормы, а не одна сплошная через весь борт
-  const tg=new THREE.BoxGeometry(.5,.08,.1);
-  const tails=[-.62,.62].map(x=>{
-    const m=new THREE.Mesh(tg,tl); m.position.set(x,.95,-2.2); car.add(m); return m;
+  [-.62,.62].forEach(x=>{
+    const m=new THREE.Mesh(TAIL_GEO,tl); m.position.set(x,.95,-2.2); car.add(m);
   });
-  car.userData.tail=tails; car.userData.tailMat=tl;
+  car.userData.tailMat=tl;   // цвет стопов правится в цикле кадра через материал
 
   // ореолы фар — дают bloom-эффект без постобработки
   [-.62,.62].forEach(x=>{
@@ -1253,12 +1261,22 @@ const TRACK_N=520;
 const tracks=new THREE.InstancedMesh(new THREE.PlaneGeometry(.5,1.6),
   new THREE.MeshBasicMaterial({color:0x1D1A16,transparent:true,opacity:.32,depthWrite:false}), TRACK_N);
 tracks.frustumCulled=false; scene.add(tracks);
+/* Буферы, которые переписываются каждый кадр, помечаем как динамические:
+   по умолчанию three отдаёт их драйверу с подсказкой STATIC_DRAW, и тот
+   раскладывает память под данные, которые меняться не будут. Только подсказка,
+   на содержимое и на порядок обновления не влияет. */
+tracks.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 let trackI=0; const tDummy=new THREE.Object3D(); tDummy.rotation.order='YXZ';
-{ // спрятать все следы за карту
-  tDummy.position.set(0,-500,0); tDummy.updateMatrix();
+// спрятать все следы за карту — при старте и при каждом рестарте, иначе новая
+// партия начиналась с чужими следами: буфер кольцевой и сам себя не чистит
+function clearTracks(){
+  tDummy.position.set(0,-500,0); tDummy.rotation.set(0,0,0); tDummy.scale.set(1,1,1);
+  tDummy.updateMatrix();
   for(let i=0;i<TRACK_N;i++) tracks.setMatrixAt(i,tDummy.matrix);
   tracks.instanceMatrix.needsUpdate=true;
+  trackI=0;
 }
+clearTracks();
 function addTrack(x,y,z,yaw){
   tDummy.position.set(x,y+.20,z); tDummy.rotation.set(-Math.PI/2,yaw,0);
   tDummy.scale.set(1,1,1); tDummy.updateMatrix();
@@ -1273,6 +1291,8 @@ const dustPos=new Float32Array(DUST_N*3), dustVel=new Float32Array(DUST_N*3),
 const dustGeo=new THREE.BufferGeometry();
 dustGeo.setAttribute('position',new THREE.BufferAttribute(dustPos,3));
 dustGeo.setAttribute('color',   new THREE.BufferAttribute(dustCol,3));
+dustGeo.attributes.position.setUsage(THREE.DynamicDrawUsage);
+dustGeo.attributes.color.setUsage(THREE.DynamicDrawUsage);
 const dust=new THREE.Points(dustGeo,new THREE.PointsMaterial({size:.62,vertexColors:true,
   transparent:true,opacity:.55,depthWrite:false}));
 dust.frustumCulled=false; scene.add(dust);
@@ -1284,6 +1304,9 @@ function spawnDust(x,y,z,r=0.79,g=0.70,b=0.54,up=1){
   dustVel[i*3]=(Math.random()-.5)*2.2; dustVel[i*3+1]=(1+Math.random()*1.6)*up; dustVel[i*3+2]=(Math.random()-.5)*2.2;
   dustCol[i*3]=r; dustCol[i*3+1]=g; dustCol[i*3+2]=b;
   dustLife[i]=.9;
+  // цвета меняются только здесь, поэтому и заливка в GPU нужна только здесь;
+  // в цикле кадра она была холостой — три килобайта каждый кадр ни за чем
+  dustGeo.attributes.color.needsUpdate=true;
 }
 
 // искры от ударов
@@ -1291,6 +1314,7 @@ const SPARK_N=140;
 const sparkPos=new Float32Array(SPARK_N*3), sparkVel=new Float32Array(SPARK_N*3), sparkLife=new Float32Array(SPARK_N);
 const sparkGeo=new THREE.BufferGeometry();
 sparkGeo.setAttribute('position',new THREE.BufferAttribute(sparkPos,3));
+sparkGeo.attributes.position.setUsage(THREE.DynamicDrawUsage);
 const sparks=new THREE.Points(sparkGeo,new THREE.PointsMaterial({color:0xFFB25A,size:.42,
   transparent:true,opacity:.95,depthWrite:false,blending:THREE.AdditiveBlending}));
 sparks.frustumCulled=false; scene.add(sparks);
@@ -1316,6 +1340,7 @@ for(let i=0;i<RAIN_N;i++) rainDrops.push({
 });
 const rainGeo=new THREE.BufferGeometry();
 rainGeo.setAttribute('position',new THREE.BufferAttribute(rainPos,3));
+rainGeo.attributes.position.setUsage(THREE.DynamicDrawUsage);
 const rainMat=new THREE.LineBasicMaterial({color:0xBFD8E8,transparent:true,opacity:0,
   depthWrite:false,fog:true});
 const rain=new THREE.LineSegments(rainGeo,rainMat);
@@ -1347,19 +1372,19 @@ const tCab =new THREE.InstancedMesh(new THREE.BoxGeometry(1.7,.6,2.0),
 tBody.castShadow=tCab.castShadow=true; tBody.frustumCulled=tCab.frustumCulled=false;
 scene.add(tBody); scene.add(tCab);
 // фары и стопы трафика — по два инстанса на машину (левый/правый), индексы i*2, i*2+1
-const tHead=new THREE.InstancedMesh(new THREE.BoxGeometry(.42,.2,.12),
+const tHead=new THREE.InstancedMesh(HEAD_GEO,
   new THREE.MeshBasicMaterial({color:0xFFF0C0}), TRAFFIC_N*2);
-const tTail=new THREE.InstancedMesh(new THREE.BoxGeometry(.5,.08,.1),
+const tTail=new THREE.InstancedMesh(TAIL_GEO,
   new THREE.MeshBasicMaterial({color:0xC22A1E}), TRAFFIC_N*2);
 tHead.frustumCulled=tTail.frustumCulled=false;
 scene.add(tHead); scene.add(tTail);
 // колёса трафика — четыре инстанса на машину, индексы i*4 .. i*4+3
-const twg=new THREE.CylinderGeometry(.45,.45,.34,10); twg.rotateZ(Math.PI/2);
 const TWHEEL=[[-.95,-1.5],[.95,-1.5],[-.95,1.5],[.95,1.5]];
-const tWheel=new THREE.InstancedMesh(twg,
+const tWheel=new THREE.InstancedMesh(WHEEL_GEO,
   new THREE.MeshLambertMaterial({color:0x23272C,flatShading:true}), TRAFFIC_N*4);
 tWheel.castShadow=true; tWheel.frustumCulled=false;
 scene.add(tWheel);
+[tBody,tCab,tHead,tTail,tWheel].forEach(m=>m.instanceMatrix.setUsage(THREE.DynamicDrawUsage));
 {
   const palette=[0xB8422F,0x2F6FB8,0xE0E2E4,0x3F7A46,0x8A8F96,0xE0A423];
   const c=new THREE.Color();
@@ -1564,12 +1589,11 @@ const stationLife= ()=>S.found===0 ? Infinity
 // свободно ли место: крупные объекты держим на расстоянии, фонари — вплотную нельзя
 function clearSpot(x,z,relaxed){
   const lim=activeBarr();
-  for(const c of colliders){
-    if(c.idx!==undefined && c.idx>=lim) continue;
+  return !nearColliders(x,z,c=>{
+    if(c.idx!==undefined && c.idx>=lim) return false;   // барьер ещё не включён
     const need = c.r>=1 ? (relaxed?12:20) : (relaxed?5:7);
-    if((c.x-x)**2+(c.z-z)**2 < need*need) return false;
-  }
-  return true;
+    return (c.x-x)**2+(c.z-z)**2 < need*need;
+  });
 }
 
 const EDGE = 55;                                   // запас до края карты под габариты АЗС
@@ -1635,7 +1659,9 @@ function placeCans(){
       const t=0.25+Math.random()*0.7;
       const x=clamp(lerp(S.x,stationPos.x,t)+(Math.random()*2-1)*90,-MAP+30,MAP-30);
       const z=clamp(lerp(S.z,stationPos.z,t)+(Math.random()*2-1)*90,-MAP+30,MAP-30);
-      if(colliders.some(o=>(o.x-x)**2+(o.z-z)**2<100)) continue;
+      // барьеры здесь НЕ фильтруются по активности, в отличие от clearSpot:
+      // канистра не должна лечь в точку, где барьер появится позже
+      if(nearColliders(x,z,o=>(o.x-x)**2+(o.z-z)**2<100)) continue;
       c.mesh.position.set(x,heightAt(x,z)+.75,z); c.mesh.visible=true; c.taken=false; return;
     }
     c.taken=true; c.mesh.visible=false;
@@ -1656,8 +1682,16 @@ function reset(){
   input.f=input.b=input.l=input.r=input.hand=0; input.tsteer=0;
   barriers.count=0;
   traffic.forEach(t=>t.alive=false);
+  clearTracks();
   placeStation(); placeCans();
   car.position.set(S.x,heightAt(S.x,S.z),S.z);
+  /* Камеру тоже возвращаем на место. Без этого camPos, camAim и fov оставались
+     от прошлой партии, и рестарт начинался с полусекундного пролёта через
+     полкарты к новой машине. Значения — те же, что посчитал бы tick() на
+     установившемся ходу: машина в (0,-40) курсом на +Z, скорость нулевая. */
+  camPos.set(S.x, car.position.y+5.0, S.z-11.5);
+  camAim.set(S.x, car.position.y+2.1, S.z+7);
+  camera.fov=58; camera.updateProjectionMatrix();
   el.vig.classList.remove('on'); el.warn.classList.remove('on');
   Sfx.init(); Sfx.ignition(); Sfx.rain(0); S.engineOn=true;
   $('over').classList.remove('win');
@@ -1751,9 +1785,7 @@ function drive(dt){
   const off = !onRoad(S.x,S.z);
   const hasFuel = S.fuel>0.01;
   const reserve = S.fuel<3;                       // последние литры — тихий ход
-  const water = inLake(S.x,S.z);                  // в озере вязко
   let gripMax = (off?MAX_SPEED*0.62:MAX_SPEED)*(1-S.rain*0.06)*S.spd;
-  if(water) gripMax=Math.min(gripMax, MAX_SPEED*0.3);
   if(reserve) gripMax=Math.min(gripMax,11.5);
 
   // руль: клавиши или сенсорный джойстик; чем быстрее, тем меньше угол
@@ -1781,7 +1813,7 @@ function drive(dt){
   }
   if(input.hand && Math.abs(vF)>0.2) vF -= BRAKE*0.85*dt*Math.sign(vF);
 
-  const drag = (off?1.9:0.8) + (hasFuel?0:2.4) + (water?3.4:0);
+  const drag = (off?1.9:0.8) + (hasFuel?0:2.4);
   vF -= vF*drag*dt*0.35;
   vF -= Math.sign(vF)*(off?3.2:1.4)*dt;
   if(Math.abs(vF)<0.12) vF=0;
@@ -1856,53 +1888,77 @@ function fmtTime(t){ const m=Math.floor(t/60), s=Math.floor(t%60); return m+':'+
 function showToast(text){ el.toast.textContent=text; el.toast.classList.remove('show');
   void el.toast.offsetWidth; el.toast.classList.add('show'); }
 
+/* HUD переписывался целиком каждый кадр — около сорока обращений к DOM, почти
+   все теми же значениями, что и кадром раньше. Дороже всего обходился innerHTML
+   у литров: полный разбор HTML шестьдесят раз в секунду. Теперь значение
+   сравнивается с прошлым и уходит в DOM только при изменении.
+   Разметку не трогаем: у #fuelnum правится сам текстовый узел, а <small> Л</small>
+   остаётся на месте. classList.toggle(name, force) и так идемпотентен — его
+   кэшировать незачем. */
+const hudLast = {};
+const hudSet = (node, k, v)=>{ if(hudLast[k]!==v){ hudLast[k]=v; node.textContent=v; } };
+const hudStyle = (node, prop, k, v)=>{ if(hudLast[k]!==v){ hudLast[k]=v; node.style[prop]=v; } };
+const fuelText = el.fuelnum.firstChild;      // текстовый узел с числом, без <small>
+
 function updateHud(off){
   const pct=S.fuel/S.tankMax;
-  el.az.textContent=S.found+' / '+GOAL;
-  el.score.textContent=S.score;
-  el.time.textContent=fmtTime(S.time);
-  el.fuelnum.innerHTML=S.fuel.toFixed(1)+'<small> Л</small>';
-  el.fuelpct.textContent=Math.round(pct*100)+'%';
-  el.speed.textContent=Math.round(Math.abs(S.speed)*3.6);
+  hudSet(el.az,   'az',    S.found+' / '+GOAL);
+  hudSet(el.score,'score', S.score);
+  hudSet(el.time, 'time',  fmtTime(S.time));
+  hudSet(fuelText,'fuel',  S.fuel.toFixed(1));
+  hudSet(el.fuelpct,'pct', Math.round(pct*100)+'%');
+  hudSet(el.speed,'speed', Math.round(Math.abs(S.speed)*3.6));
   // линии скорости проявляются только на верхней трети диапазона
-  el.streaks.style.opacity=(clamp((Math.abs(S.speed)/MAX_SPEED-0.55)/0.45,0,1)*0.5).toFixed(2);
+  hudStyle(el.streaks,'opacity','streaks',
+    (clamp((Math.abs(S.speed)/MAX_SPEED-0.55)/0.45,0,1)*0.5).toFixed(2));
 
-  el.combo.textContent='×'+S.combo;
-  el.combo.className = S.combo>1 ? 'hot' : '';
-  const lit=Math.ceil(pct*SEGS);
-  for(let i=0;i<SEGS;i++){
-    segs[i].className = i<lit ? (pct<0.2?'warn':'on') : '';
+  hudSet(el.combo,'combo','×'+S.combo);
+  const comboCls = S.combo>1 ? 'hot' : '';
+  if(hudLast.comboCls!==comboCls){ hudLast.comboCls=comboCls; el.combo.className=comboCls; }
+  // шкала топлива: класс сегмента зависит только от числа горящих делений и от
+  // того, аварийный ли уровень, — пока не изменилось ни то ни другое, все
+  // шестнадцать записей были бы пустой работой
+  const lit=Math.ceil(pct*SEGS), lowFuel=pct<0.2;
+  if(hudLast.lit!==lit || hudLast.low!==lowFuel){
+    hudLast.lit=lit; hudLast.low=lowFuel;
+    for(let i=0;i<SEGS;i++){
+      segs[i].className = i<lit ? (lowFuel?'warn':'on') : '';
+    }
   }
-  el.box.classList.toggle('low', pct<0.2);
+  el.box.classList.toggle('low', lowFuel);
   el.vig.classList.toggle('on', (pct<0.2||S.leak>0) && S.mode==='play');
   el.warn.classList.toggle('on', (pct<0.2||S.leak>0) && S.mode==='play');
-  el.warn.textContent = S.leak>0 ? 'ПРОБИТ БАК — ТОПЛИВО УХОДИТ' : 'НИЗКИЙ УРОВЕНЬ ТОПЛИВА';
+  hudSet(el.warn,'warn', S.leak>0 ? 'ПРОБИТ БАК — ТОПЛИВО УХОДИТ' : 'НИЗКИЙ УРОВЕНЬ ТОПЛИВА');
 
   // режим движения
-  if(S.mode==='refuel') { el.mode.textContent='ЗАПРАВКА'; el.mode.style.color='var(--ok)'; }
-  else if(S.fuel<3 && S.fuel>0){ el.mode.textContent='РЕЗЕРВ — ТИХИЙ ХОД'; el.mode.style.color='var(--red)'; }
+  let modeText='', modeCol='';
+  if(S.mode==='refuel') { modeText='ЗАПРАВКА'; modeCol='var(--ok)'; }
+  else if(S.fuel<3 && S.fuel>0){ modeText='РЕЗЕРВ — ТИХИЙ ХОД'; modeCol='var(--red)'; }
   else if(Math.abs(S.lat)>3.2 && Math.abs(S.speed)>10){
-    el.mode.textContent='ЗАНОС +'+Math.round(S.driftBank); el.mode.style.color='var(--amber)'; }
-  else if(!input.f && !input.b && Math.abs(S.speed)>4){ el.mode.textContent='НАКАТ'; el.mode.style.color='var(--ok)'; }
-  else if(off && Math.abs(S.speed)>2){ el.mode.textContent='БЕЗДОРОЖЬЕ ×1.35'; el.mode.style.color='var(--red)'; }
-  else el.mode.textContent='';
+    modeText='ЗАНОС +'+Math.round(S.driftBank); modeCol='var(--amber)'; }
+  else if(!input.f && !input.b && Math.abs(S.speed)>4){ modeText='НАКАТ'; modeCol='var(--ok)'; }
+  else if(off && Math.abs(S.speed)>2){ modeText='БЕЗДОРОЖЬЕ ×1.35'; modeCol='var(--red)'; }
+  hudSet(el.mode,'modeText',modeText);
+  // цвет ставился только в непустых ветках — сохраняем: у пустой подписи он
+  // остаётся прежним, всё равно её не видно
+  if(modeCol) hudStyle(el.mode,'color','modeCol',modeCol);
 
   // детектор: сила сигнала всегда, направление — только при захвате.
   // Шкала и метка направления рисуются на ободке карты, здесь только подпись.
   const det=detector();
   el.mapbox.classList.toggle('lock', det.lock);
-  el.cdist.textContent = det.lock ? Math.round(det.dist)+' М'
-                                  : 'СИГНАЛ '+Math.round(det.sig*100)+'%';
+  hudSet(el.cdist,'cdist', det.lock ? Math.round(det.dist)+' М'
+                                    : 'СИГНАЛ '+Math.round(det.sig*100)+'%');
 
   // таймер работы АЗС
   if(!isFinite(S.stMax)){
-    el.stfill.style.width='100%';
-    el.sttext.textContent='ПЕРВАЯ АЗС ЖДЁТ';
+    hudStyle(el.stfill,'width','stfill','100%');
+    hudSet(el.sttext,'sttext','ПЕРВАЯ АЗС ЖДЁТ');
     el.sttimer.classList.remove('soon');
   } else {
     const left=Math.max(0,S.stTimer);
-    el.stfill.style.width=Math.round(left/S.stMax*100)+'%';
-    el.sttext.textContent='ЗАКРЫТИЕ ЧЕРЕЗ '+Math.ceil(left)+' С';
+    hudStyle(el.stfill,'width','stfill',Math.round(left/S.stMax*100)+'%');
+    hudSet(el.sttext,'sttext','ЗАКРЫТИЕ ЧЕРЕЗ '+Math.ceil(left)+' С');
     el.sttimer.classList.toggle('soon', left<15);
   }
 }
@@ -1919,6 +1975,7 @@ function detector(){
   return { dist, lock, bearing, sig:clamp(1-dist/900,0,1) };
 }
 
+const DASH_ZONE=[14,12], DASH_OFF=[];   // константы: setLineDash иначе плодил массивы каждый кадр
 function drawMinimap(){
   const c=mmCtx, k=MM/150;          // маркеры в пикселях канвы — от её размера
   c.setTransform(1,0,0,1,0,0);
@@ -1953,8 +2010,8 @@ function drawMinimap(){
     c.beginPath(); c.arc(t.x,t.z,7,0,6.283); c.fill(); });
   // зона поиска и точка АЗС (точка — только при захвате)
   const det=detector();
-  c.strokeStyle='rgba(56,255,176,.55)'; c.lineWidth=4; c.setLineDash([14,12]);
-  c.beginPath(); c.arc(S.zoneX,S.zoneZ,ZONE_R,0,6.283); c.stroke(); c.setLineDash([]);
+  c.strokeStyle='rgba(56,255,176,.55)'; c.lineWidth=4; c.setLineDash(DASH_ZONE);
+  c.beginPath(); c.arc(S.zoneX,S.zoneZ,ZONE_R,0,6.283); c.stroke(); c.setLineDash(DASH_OFF);
   if(det.lock){
     c.fillStyle='#38FFB0';
     c.beginPath(); c.arc(stationPos.x,stationPos.z,15,0,6.283); c.fill();
@@ -1996,6 +2053,10 @@ function drawMinimap(){
 const clock=new THREE.Clock();
 const camPos=new THREE.Vector3(0,8,-14), camAim=new THREE.Vector3();
 const sunDir=new THREE.Vector3(), camFwd=new THREE.Vector3(), sunScreen=new THREE.Vector3();
+/* Рабочие объекты кадра. Раньше на каждый кадр создавались три Vector3 и один
+   Color — за час игры это пара миллионов короткоживущих объектов на ровном месте. */
+const camWant=new THREE.Vector3(), camLook=new THREE.Vector3();
+const WHITE=new THREE.Color(0xFFFFFF);
 const wetLens=document.getElementById('wetlens');
 const flare={ el:document.getElementById('flare'),
               parts:[...document.querySelectorAll('#flare i')],
@@ -2142,14 +2203,12 @@ function tick(){
       addTrack(bx-Math.cos(S.yaw)*0.95, heightAt(bx,bz), bz+Math.sin(S.yaw)*0.95, S.yaw);
       if(off||sliding) spawnDust(bx,heightAt(bx,bz),bz);
     }
-    // выхлоп из трубы под нагрузкой и брызги в воде
+    // выхлоп из трубы под нагрузкой
     if(throttle>0 && Math.random()<0.55){
       const ex=S.x-Math.sin(S.yaw)*2.3+Math.cos(S.yaw)*0.5;
       const ez=S.z-Math.cos(S.yaw)*2.3-Math.sin(S.yaw)*0.5;
       spawnDust(ex, car.position.y+0.5, ez, .42,.44,.46, .5);
     }
-    if(inLake(S.x,S.z) && Math.abs(S.speed)>4 && Math.random()<0.8)
-      spawnDust(S.x-Math.sin(S.yaw)*1.6, car.position.y+0.3, S.z-Math.cos(S.yaw)*1.6, .72,.86,.92, 1.4);
 
     /* --- звук двигателя и покрышек --- */
     if(S.engineOn){
@@ -2160,6 +2219,15 @@ function tick(){
     S.brakeT-=dt;
     if((input.b||input.hand) && S.speed>12 && S.brakeT<=0){ Sfx.brake(); S.brakeT=0.22; }
   }
+
+  /* Трафик на заправке и на экране перков. Раньше updateTraffic() звался только
+     в режиме play, и встречные машины замирали посреди дороги: полторы секунды
+     на заправке и сколько угодно, пока игрок выбирает карточку, — при том что
+     дождь, пыль, свет и камера продолжали жить. Вызов внутри play оставлен на
+     прежнем месте, чтобы порядок кадра в основном режиме не сдвинулся ни на шаг.
+     Столкновение с игроком внутри updateTraffic закрыто своей проверкой на
+     S.mode==='play', так что здесь машина по-прежнему неуязвима. */
+  if(S.mode==='refuel'||S.mode==='perk') updateTraffic(dt);
 
   /* --- пыль (интегрирование) --- */
   for(let i=0;i<DUST_N;i++){
@@ -2173,7 +2241,6 @@ function tick(){
     }
   }
   dustGeo.attributes.position.needsUpdate=true;
-  dustGeo.attributes.color.needsUpdate=true;
 
   /* --- искры --- */
   for(let i=0;i<SPARK_N;i++){
@@ -2274,9 +2341,8 @@ function tick(){
   stationGlow.material.opacity=0.35+S.night*0.5;
 
   // задник: облака подкрашиваются тем же светом
-  cloudMat.color.copy(cHor).lerp(new THREE.Color(0xFFFFFF), 0.25*(1-gloom));
+  cloudMat.color.copy(cHor).lerp(WHITE, 0.25*(1-gloom));
   cloudMat.opacity=0.28+0.32*(1-gloom);
-  waterMat.color.copy(cFog).lerp(WATER_DEEP, 0.62);
 
   /* --- солнце ходит по кругу и следует за машиной (тени всегда рядом) --- */
   const sa=phase*Math.PI*2;
@@ -2316,10 +2382,10 @@ function tick(){
   }
 
   /* --- камера от третьего лица --- */
-  const back=new THREE.Vector3(-Math.sin(S.yaw),0,-Math.cos(S.yaw));
+  const bx=-Math.sin(S.yaw), bz=-Math.cos(S.yaw);
   const dist=11.5+Math.abs(S.speed)*0.13;
-  const want=new THREE.Vector3(
-    car.position.x+back.x*dist, car.position.y+5.0+Math.abs(S.speed)*0.02, car.position.z+back.z*dist);
+  const want=camWant.set(
+    car.position.x+bx*dist, car.position.y+5.0+Math.abs(S.speed)*0.02, car.position.z+bz*dist);
   want.y=Math.max(want.y, heightAt(want.x,want.z)+2.6);
   camPos.lerp(want, 1-Math.exp(-6.5*dt));
   if(S.shake>0){
@@ -2333,7 +2399,7 @@ function tick(){
     camera.fov = lerp(camera.fov, wantFov, 1-Math.exp(-3.5*dt));
     camera.updateProjectionMatrix();
   }
-  camAim.lerp(new THREE.Vector3(car.position.x+Math.sin(S.yaw)*7, car.position.y+2.1, car.position.z+Math.cos(S.yaw)*7),
+  camAim.lerp(camLook.set(car.position.x+Math.sin(S.yaw)*7, car.position.y+2.1, car.position.z+Math.cos(S.yaw)*7),
     1-Math.exp(-7*dt));
   camera.lookAt(camAim);
   sky.position.copy(camera.position); stars.position.copy(camera.position);
@@ -2440,7 +2506,8 @@ function buildTrophy(){
   sc.environment=pm.fromEquirectangular(et).texture;
   pm.dispose(); et.dispose();
 
-  const key=new THREE.DirectionalLight(0xFFF0CE,2.2); key.position.set(3,5,6); sc.add(key);
+  // не key: так зовётся функция ключа сетки коллайдеров в модульной области
+  const keyLight=new THREE.DirectionalLight(0xFFF0CE,2.2); keyLight.position.set(3,5,6); sc.add(keyLight);
   const rim=new THREE.DirectionalLight(0xFFB454,1.6); rim.position.set(-5,1,-4); sc.add(rim);
 
   const g=buildJerrycan(); sc.add(g);
@@ -2527,6 +2594,11 @@ function confettiTick(dt){
     g.setTransform(dpr,0,0,dpr,0,0);
   }
   g.globalAlpha=1;
+  /* Залпы отстрелялись, лоскуты долетели — гасим канвас сами. Иначе полноэкранный
+     слой (при dpr 2 это 8 мегапикселей) продолжал чиститься и композиться каждый
+     кадр до самого рестарта, параллельно с основным рендерером и рендерером
+     трофея — ровно там, где кадров и так меньше всего. */
+  if(!conf.p.length && !conf.shots.length) confettiStop();
 }
 
 /* --- конец игры --- */
@@ -2534,14 +2606,21 @@ function finish(win){
   Sfx.mute();
   if(win){ Sfx.refuelDone(); Sfx.tone(523,1046,1.2,'triangle',.18,.2); }
   const left=Math.round(Math.hypot(stationPos.x-S.x, stationPos.z-S.z));
+  /* Чтение и запись разнесены: если setItem падает (квота, приватный режим),
+     раньше catch обнулял уже успешно прочитанный список, и игрок терял таблицу
+     рекордов из виду. Теперь несохранённый результат просто не переживёт
+     перезагрузку, но на экране показывается вместе со старыми. */
   let top=[];
   try{
-    top=JSON.parse(localStorage.getItem('nb_top')||'[]');
-    if(!Array.isArray(top)) top=[];
-    top.push(S.score);
-    top.sort((a,b)=>b-a); top=top.slice(0,5);
-    localStorage.setItem('nb_top', JSON.stringify(top));
-  }catch(e){ top=[S.score]; }
+    const raw=JSON.parse(localStorage.getItem('nb_top')||'[]');
+    if(Array.isArray(raw)) top=raw.filter(v=>typeof v==='number');
+  }catch(e){ top=[]; }
+  top.push(S.score);
+  top.sort((a,b)=>b-a); top=top.slice(0,5);
+  // индекс своей строки берём до записи: пометка должна стоять у одной записи,
+  // а не у каждой, чей счёт совпал с текущим
+  const mine=top.indexOf(S.score);
+  try{ localStorage.setItem('nb_top', JSON.stringify(top)); }catch(e){}
 
   $('over-title').innerHTML = win
     ? 'Ты герой!'
@@ -2563,7 +2642,7 @@ function finish(win){
   $('r-drift').textContent=S.bestDrift;
   $('r-left').textContent=win ? '—' : left+' м до АЗС';
   $('best').textContent='ЛУЧШИЕ РЕЗУЛЬТАТЫ\n'+
-    top.map((v,i)=>(i+1)+'.  '+v+(v===S.score?'   ← сейчас':'')).join('\n');
+    top.map((v,i)=>(i+1)+'.  '+v+(i===mine?'   ← сейчас':'')).join('\n');
   $('over').classList.remove('hidden');
   setTimeout(()=>{ try{ $('again').focus(); }catch(e){} }, 30);
 }
