@@ -419,7 +419,8 @@ body.touch .opt{font-size:11px;padding:11px 14px}
 <canvas id="confetti"></canvas>
 
 <script type="importmap">
-{ "imports": { "three": "https://unpkg.com/three@0.185.1/build/three.module.js" } }
+{ "imports": { "three": "https://unpkg.com/three@0.185.1/build/three.module.js",
+               "three/addons/": "https://unpkg.com/three@0.185.1/examples/jsm/" } }
 </script>
 
 <script type="module">
@@ -591,24 +592,31 @@ const canvas   = document.getElementById('scene');
 const renderer = new THREE.WebGLRenderer({canvas, antialias:true, powerPreference:'high-performance'});
 renderer.setPixelRatio(Math.min(devicePixelRatio,1.75));
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+/* PCFSoftShadowMap в r185 объявлен устаревшим и молча подменяется на PCF.
+   Мягкость теперь задаёт shadow.radius: PCF берёт пять выборок диском Фогеля
+   с шумовым поворотом, радиус — в текселях карты теней. */
+renderer.shadowMap.type = THREE.PCFShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;   // без неё яркие места выжигаются в белое
-renderer.toneMappingExposure = 1.18;
+renderer.toneMappingExposure = 1.0;
+const MAX_ANISO = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+// телефон: трава реже, без постобработки и с картой теней поменьше (см. applyQuality)
+const COARSE = matchMedia('(pointer:coarse)').matches || 'ontouchstart' in window;
 
 const scene  = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(58, 1, .5, 1600);
 
-const DAY = { sky:new THREE.Color(0x7FB4E8), hor:new THREE.Color(0xCFE0EA), fog:new THREE.Color(0xC6D8E4),
-              sun:new THREE.Color(0xFFF1D6), amb:new THREE.Color(0x8AA3C0) };
-const DUSK= { sky:new THREE.Color(0x24406F), hor:new THREE.Color(0xFF9B58), fog:new THREE.Color(0xE68B57),
-              sun:new THREE.Color(0xFF8E4A), amb:new THREE.Color(0x8A5F6B) };
+/* Палитра неба. Теперь небо проходит тот же тональный компрессор и перевод
+   в sRGB, что и вся сцена, поэтому цвета заданы как настоящая светимость:
+   зенит — насыщенная синева, горизонт — белёсая дымка. */
+const DAY = { sky:new THREE.Color(0x2F6CC4), hor:new THREE.Color(0xB4CDE4), fog:new THREE.Color(0xAFC6DA),
+              sun:new THREE.Color(0xFFF0DC), amb:new THREE.Color(0x9DB6D0) };
+const DUSK= { sky:new THREE.Color(0x283F70), hor:new THREE.Color(0xF0955A), fog:new THREE.Color(0xC98A6C),
+              sun:new THREE.Color(0xFF8A45), amb:new THREE.Color(0x8A6070) };
 /* amb уходит только в подсветку поверхностей (hemi.color), к небу и туману
-   отношения не имеет — поэтому осветление ночного amb делает читаемыми землю
-   и дорогу, оставляя небо таким же чёрным. Прежний 0x1B2436 при интенсивности
-   0.28 давал на грунт около 3% яркости: покрытие сливалось в сплошную темноту
-   везде, куда не доставали фары. */
-const NIGHT={ sky:new THREE.Color(0x05070F), hor:new THREE.Color(0x141C2B), fog:new THREE.Color(0x101724),
-              sun:new THREE.Color(0x2A3F66), amb:new THREE.Color(0x39485F) };
+   отношения не имеет — ночной amb оставлен светлым, чтобы земля и дорога
+   читались и там, куда не достают фары. */
+const NIGHT={ sky:new THREE.Color(0x02040A), hor:new THREE.Color(0x0C1320), fog:new THREE.Color(0x0A101B),
+              sun:new THREE.Color(0x4A6698), amb:new THREE.Color(0x45587A) };
 const cSky=new THREE.Color(), cHor=new THREE.Color(), cFog=new THREE.Color();
 // цвет = день→ночь, а на переходе подмешивается закатная палитра
 function palette(out, key, t, dusk){
@@ -619,34 +627,360 @@ function palette(out, key, t, dusk){
 
 scene.fog = new THREE.Fog(DAY.fog.clone(), 90, VIEW);
 
-// небо-градиент (дешевле кубмапы)
+/* ---------- процедурные текстуры ----------
+   Всё рисуется в канвас при загрузке: ни одного файла, как и со звуком.
+   Шум периодический — решётка заворачивается по периоду, текстура тайлится без шва. */
+function makeNoise(seed){
+  const r=mulberry32(seed), P=new Float32Array(64*64);
+  for(let i=0;i<P.length;i++) P[i]=r();
+  return (x,y,px,py=px)=>{
+    const xi=Math.floor(x), yi=Math.floor(y), xf=x-xi, yf=y-yi;
+    const u=xf*xf*(3-2*xf), v=yf*yf*(3-2*yf);
+    const x0=((xi%px)+px)%px, y0=((yi%py)+py)%py, x1=(x0+1)%px, y1=(y0+1)%py;
+    const a=P[x0*64+y0], b=P[x1*64+y0], c=P[x0*64+y1], d=P[x1*64+y1];
+    return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;
+  };
+}
+// фрактальный шум в [0..1]; u,v в [0..1), base — число ячеек на первой октаве
+function fbm2(n,u,v,base,oct,sx=1,sy=1){
+  let s=0,a=.5,f=base,w=0;
+  for(let i=0;i<oct;i++){ s+=a*n(u*f*sx,v*f*sy,f*sx,f*sy); w+=a; a*=.5; f*=2; }
+  return s/w;
+}
+function canvasTex(w,h,fill,{srgb=true,post=null}={}){
+  const c=document.createElement('canvas'); c.width=w; c.height=h;
+  const g=c.getContext('2d');
+  if(fill){ const img=g.createImageData(w,h); fill(img.data,w,h); g.putImageData(img,0,0); }
+  if(post) post(g,w,h);
+  const t=new THREE.CanvasTexture(c);
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.anisotropy=MAX_ANISO;
+  t.colorSpace=srgb?THREE.SRGBColorSpace:THREE.NoColorSpace;
+  return t;
+}
+// карта нормалей из периодического поля высот. Канвас переворачивается по Y
+// при загрузке, поэтому «вверх по v» — это строка выше
+function normalTex(hf,w,h,k){
+  return canvasTex(w,h,d=>{
+    for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+      const l=hf[y*w+(x-1+w)%w], r=hf[y*w+(x+1)%w], up=hf[((y-1+h)%h)*w+x], dn=hf[((y+1)%h)*w+x];
+      const nx=(l-r)*k, ny=(dn-up)*k, il=1/Math.hypot(nx,ny,1), i=(y*w+x)*4;
+      d[i]=(nx*il*.5+.5)*255; d[i+1]=(ny*il*.5+.5)*255; d[i+2]=(il*.5+.5)*255; d[i+3]=255;
+    }
+  },{srgb:false});
+}
+const put=(d,i,r,g,b,a=1)=>{ d[i]=clamp(r,0,1)*255; d[i+1]=clamp(g,0,1)*255; d[i+2]=clamp(b,0,1)*255; d[i+3]=a*255; };
+const NA=makeNoise(11), NB=makeNoise(23), NC=makeNoise(37), ND=makeNoise(51);
+const TEX={};
+{ // трава: светлотная деталь — сам цвет даёт рельеф вершинными цветами
+  const W=256, hf=new Float32Array(W*W);
+  TEX.grass=canvasTex(W,W,d=>{
+    for(let y=0;y<W;y++) for(let x=0;x<W;x++){
+      const u=x/W, v=y/W;
+      const fine=NB(u*64,v*64,64), blade=NC(u*32,v*32,32), patch=fbm2(NA,u,v,4,4);
+      const l=.66+.2*fine+.12*blade+.22*(patch-.5), dry=smooth(.55,.72,patch);
+      hf[y*W+x]=fine*.6+blade*.4;
+      put(d,(y*W+x)*4, l*(1+dry*.18), l, l*(.86-dry*.1));
+    }
+  });
+  TEX.grassN=normalTex(hf,W,W,2.2);
+}
+{ // асфальт: 18 м поперёк (вся дорога) × 36 м вдоль. R — накатанная колея,
+  // G — шероховатость, B — где собираются лужи
+  const W=512, H=1024, hf=new Float32Array(W*H), orm=new Uint8ClampedArray(W*H*4);
+  const r=mulberry32(4242);
+  // колея: правостороннее движение, центры полос ±4.6 м, колёса ±0.8 м от центра
+  const ruts=[-5.4,-3.8,3.8,5.4].map(m=>(m+9)/18);
+  TEX.asphalt=canvasTex(W,H,d=>{
+    for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+      const u=x/W, v=y/H, i=(y*W+x)*4;
+      const grain=r(), mott=fbm2(NA,u,v,4,5,1,2), fine=NB(u*64,v*64,64,64);
+      let wear=0; for(const c of ruts){ const du=(u-c)/.02; wear+=Math.exp(-du*du); }
+      wear*= .65+.35*NC(u*4,v*16,4,16);
+      const oil=[.2556,.7444].reduce((a,c)=>a+Math.exp(-(((u-c)/.012)**2)),0)*(.4+.6*ND(u*8,v*32,8,32));
+      const edge=smooth(.035,0,u)+smooth(.965,1,u);
+      let l=.40+(mott-.5)*.10+(fine-.5)*.05;
+      if(grain>.93) l+=.10*(grain-.93)/.07; else if(grain<.05) l-=.06;
+      l-=oil*.05;
+      const puddle=clamp(fbm2(NC,u,v,2,4,1,2)*1.25-.28+wear*.25+edge*.3,0,1);
+      hf[y*W+x]=grain*.5+fine*.5;
+      put(d,i, l*(1+edge*.12), l*(1+edge*.08), l*(1-edge*.02));
+      orm[i]=clamp(wear,0,1)*255; orm[i+1]=(.86+(fine-.5)*.12)*255; orm[i+2]=puddle*255; orm[i+3]=255;
+    }
+  },{post:(g,w,h)=>{
+    // трещины и заплатки поверх зерна
+    const cr=mulberry32(99);
+    g.fillStyle='rgba(20,20,20,.07)';
+    for(let k=0;k<5;k++){ const px=cr()*w, py=cr()*h, pw=40+cr()*120, ph=60+cr()*200; g.fillRect(px,py,pw,ph); }
+    g.strokeStyle='rgba(15,15,15,.28)'; g.lineWidth=1.1;
+    for(let k=0;k<14;k++){
+      let x=cr()*w, y=cr()*h; g.beginPath(); g.moveTo(x,y);
+      const a0=cr()*6.283;
+      for(let s=0;s<14;s++){ x+=Math.cos(a0+(cr()-.5)*1.6)*9; y+=Math.sin(a0+(cr()-.5)*1.6)*9; g.lineTo(x,y); }
+      g.stroke();
+    }
+  }});
+  const oc=document.createElement('canvas'); oc.width=W; oc.height=H;
+  oc.getContext('2d').putImageData(new ImageData(orm,W,H),0,0);
+  TEX.asphaltORM=new THREE.CanvasTexture(oc);
+  TEX.asphaltORM.wrapS=TEX.asphaltORM.wrapT=THREE.RepeatWrapping; TEX.asphaltORM.anisotropy=MAX_ANISO;
+  TEX.asphaltN=normalTex(hf,W,H,1.4);
+}
+// ячеистый шум Уорли (периодический) — камешки гравия, трещины камня
+function worley(n,seed){
+  const r=mulberry32(seed), P=[];
+  for(let i=0;i<n*n;i++) P.push([r(),r(),r()]);
+  return (u,v)=>{
+    const fx=u*n, fy=v*n, ix=Math.floor(fx), iy=Math.floor(fy);
+    let d1=9,d2=9,id=0;
+    for(let a=-1;a<=1;a++) for(let b=-1;b<=1;b++){
+      const cx=ix+a, cy=iy+b, p=P[((cx%n+n)%n)*n+((cy%n+n)%n)];
+      const dx=cx+p[0]-fx, dy=cy+p[1]-fy, dd=dx*dx+dy*dy;
+      if(dd<d1){ d2=d1; d1=dd; id=p[2]; } else if(dd<d2) d2=dd;
+    }
+    return [Math.sqrt(d1),Math.sqrt(d2),id];
+  };
+}
+{ // гравий обочины
+  const W=256, hf=new Float32Array(W*W), wl=worley(22,5);
+  TEX.gravel=canvasTex(W,W,d=>{
+    for(let y=0;y<W;y++) for(let x=0;x<W;x++){
+      const [d1,d2,id]=wl(x/W,y/W), edge=smooth(0,.18,d2-d1), n=NB(x/W*32,y/W*32,32);
+      const l=(.42+id*.28)*(.55+.45*edge)*(.9+.2*n);
+      hf[y*W+x]=edge*(1-d1)*.8+n*.2;
+      put(d,(y*W+x)*4, l*1.05, l*.97, l*.86);
+    }
+  });
+  TEX.gravelN=normalTex(hf,W,W,3.2);
+}
+{ // камень: серый с прожилками и пятнами лишайника
+  const W=256, hf=new Float32Array(W*W), wl=worley(6,9);
+  TEX.rock=canvasTex(W,W,d=>{
+    for(let y=0;y<W;y++) for(let x=0;x<W;x++){
+      const u=x/W, v=y/W, n=fbm2(NA,u,v,4,5), [d1,d2]=wl(u,v), crack=smooth(.02,0,d2-d1), f=NB(u*64,v*64,64);
+      const lich=smooth(.68,.74,fbm2(ND,u,v,8,3));
+      const l=(.5+(n-.5)*.3+(f-.5)*.08)*(1-crack*.18);
+      hf[y*W+x]=n*.7+f*.3-crack*.15;
+      put(d,(y*W+x)*4, l+lich*.05, l+lich*.07, l*.97-lich*.03);
+    }
+  });
+  TEX.rockN=normalTex(hf,W,W,4);
+}
+{ // кора: вертикальные борозды
+  const W=128, H=256, hf=new Float32Array(W*H);
+  TEX.bark=canvasTex(W,H,d=>{
+    for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+      const u=x/W, v=y/H, s=fbm2(NB,u,v,8,4,1,.25), g=Math.pow(Math.abs(Math.sin((u*9+s*1.6)*Math.PI)),.6);
+      const l=.22+.2*g+.06*NA(u*32,v*32,32);
+      hf[y*W+x]=g;
+      put(d,(y*W+x)*4, l*1.05, l*.92, l*.78);
+    }
+  });
+  TEX.barkN=normalTex(hf,W,H,3);
+}
+{ // обшивка стен: горизонтальная доска, грязь к низу. Цвет стен даёт инстанс
+  const W=256, hf=new Float32Array(W*W);
+  TEX.siding=canvasTex(W,W,d=>{
+    for(let y=0;y<W;y++) for(let x=0;x<W;x++){
+      const u=x/W, v=1-y/W, b=(v*16)%1, groove=smooth(.0,.08,b)*smooth(1,.9,b);
+      const n=fbm2(NA,u,v,4,4,1,4), dirt=smooth(.2,0,v)*.35+smooth(.55,.75,fbm2(NC,u,v,4,3))*.12;
+      const l=(.9-(1-groove)*.35)*(1-dirt)*(.94+.06*n);
+      hf[y*W+x]=groove*.8+b*.2;
+      put(d,(y*W+x)*4, l, l*.98, l*.95);
+    }
+  });
+  TEX.sidingN=normalTex(hf,W,W,5);
+}
+{ // профнастил кровли: волна вдоль ската, потёки ржавчины
+  const W=256, hf=new Float32Array(W*W);
+  TEX.roof=canvasTex(W,W,d=>{
+    for(let y=0;y<W;y++) for(let x=0;x<W;x++){
+      const u=x/W, v=y/W, w=Math.sin(v*32*6.2832)*.5+.5;
+      const rust=smooth(.6,.8,fbm2(NB,u,v,4,4,2,.5))*.5, n=NA(u*32,v*32,32);
+      const l=.72+.12*w+.05*n;
+      hf[y*W+x]=w;
+      put(d,(y*W+x)*4, l+rust*.15, l-rust*.12, l-rust*.28);
+    }
+  });
+  TEX.roofN=normalTex(hf,W,W,3);
+}
+{ // бетон: плиты со швами
+  const W=256;
+  TEX.concrete=canvasTex(W,W,d=>{
+    for(let y=0;y<W;y++) for(let x=0;x<W;x++){
+      const u=x/W, v=y/W, n=fbm2(NA,u,v,4,5), f=NB(u*64,v*64,64);
+      const seam=((x%128)<2||(y%128)<2)?.72:1;
+      const l=(.62+(n-.5)*.2+(f-.5)*.06)*seam;
+      put(d,(y*W+x)*4, l, l*.99, l*.96);
+    }
+  });
+}
+{ // дерево двери: вертикальные доски
+  const W=128;
+  TEX.wood=canvasTex(W,W,d=>{
+    for(let y=0;y<W;y++) for(let x=0;x<W;x++){
+      const u=x/W, v=y/W, b=(u*5)%1, seam=b<.05?.6:1, gr=NC(u*8,v*64,8,64);
+      const l=(.3+.12*gr)*seam;
+      put(d,(y*W+x)*4, l*1.25, l*.85, l*.55);
+    }
+  });
+}
+// тени облаков: мягкий фрактальный шум, сэмплируется в мировых координатах
+TEX.cloud=canvasTex(256,256,d=>{
+  for(let y=0;y<256;y++) for(let x=0;x<256;x++){
+    const n=fbm2(ND,x/256,y/256,4,5); put(d,(y*256+x)*4,n,n,n);
+  }
+},{srgb:false});
+// листва: кляксы листьев на прозрачном фоне (для карточек) и на тёмном (для объёма кроны)
+function drawLeaves(g,w,seed){
+  const r=mulberry32(seed);
+  for(let k=0;k<260;k++){
+    const x=r()*w, y=r()*w, a=r()*6.283, s=5+r()*9, l=28+r()*26, h=78+r()*40;
+    g.fillStyle=`hsl(${h},${40+r()*25}%,${l}%)`;
+    g.save(); g.translate(x,y); g.rotate(a);
+    g.beginPath(); g.ellipse(0,0,s,s*.45,0,0,6.283); g.fill();
+    g.restore();
+  }
+}
+TEX.leaf=canvasTex(256,256,null,{post:(g,w)=>{
+  // клякса-облако: листья гуще к центру, края рваные — альфа-тест даёт силуэт
+  const r=mulberry32(77);
+  g.save(); g.beginPath();
+  for(let k=0;k<22;k++){
+    const a=r()*6.283, rr=r()*w*.3, cx=w/2+Math.cos(a)*rr, cy=w/2+Math.sin(a)*rr, R=w*(.1+r()*.08);
+    g.moveTo(cx+R,cy); g.arc(cx,cy,R,0,6.283);
+  }
+  g.clip(); drawLeaves(g,w,5); g.restore();
+}});
+TEX.leafSolid=canvasTex(128,128,null,{post:(g,w)=>{ g.fillStyle='#2c4a1e'; g.fillRect(0,0,w,w); drawLeaves(g,w,6); }});
+// мягкое пятно для дыма и пыли
+TEX.puff=canvasTex(64,64,d=>{
+  for(let y=0;y<64;y++) for(let x=0;x<64;x++){
+    const dx=(x-31.5)/32, dy=(y-31.5)/32, r2=dx*dx+dy*dy, n=NA(x/64*8,y/64*8,8);
+    put(d,(y*64+x)*4,1,1,1, clamp((1-r2)*(.6+.4*n),0,1)**1.6);
+  }
+});
+
+/* ---------- «улучшенные» материалы ----------
+   Один патч шейдера на все материалы сцены: мировая позиция в вершинном шейдере,
+   туман по радиальной дистанции с подсветкой со стороны солнца (воздушная
+   перспектива), тени от облаков на всём освещённом. Униформы общие — меняются
+   раз за кадр и сразу видны всем программам. */
+const U = {
+  uTime:{value:0}, uSunDir:{value:new THREE.Vector3(0,1,0)}, uScatter:{value:new THREE.Color(0,0,0)},
+  uCloudTex:{value:TEX.cloud}, uCloudOff:{value:new THREE.Vector2()}, uCloudShadow:{value:0}, uWet:{value:0}
+};
+const GLSL_COMMON = `
+varying vec3 vWPos;
+uniform float uTime; uniform vec3 uSunDir; uniform vec3 uScatter;
+uniform sampler2D uCloudTex; uniform vec2 uCloudOff; uniform float uCloudShadow; uniform float uWet;
+float nbGrid(float v){ return abs(v - floor(v/${ROAD_STEP}.0 + 0.5)*${ROAD_STEP}.0); }
+`;
+function enhance(mat, o={}){
+  if(mat.userData.nbDone) return; mat.userData.nbDone=true;
+  mat.onBeforeCompile = (sh)=>{
+    for(const k in U) sh.uniforms[k]=U[k];
+    if(o.uniforms) Object.assign(sh.uniforms, o.uniforms);
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\n'+GLSL_COMMON+(o.vDecl||''));
+    if(o.vert) sh.vertexShader = o.vert(sh.vertexShader);
+    sh.vertexShader = sh.vertexShader.replace('#include <fog_vertex>', `#include <fog_vertex>
+      { vec4 nbW = vec4(transformed, 1.0);
+        #ifdef USE_INSTANCING
+          nbW = instanceMatrix * nbW;
+        #endif
+        vWPos = (modelMatrix * nbW).xyz; }`);
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\n'+GLSL_COMMON+(o.fDecl||''));
+    sh.fragmentShader = sh.fragmentShader.replace('#include <lights_fragment_end>', `#include <lights_fragment_end>
+      { float cs = 1.0 - uCloudShadow*smoothstep(0.45, 0.7, texture2D(uCloudTex, vWPos.xz*0.0016 + uCloudOff).r);
+        reflectedLight.directDiffuse *= cs; reflectedLight.directSpecular *= cs; }`);
+    if(o.frag) sh.fragmentShader = o.frag(sh.fragmentShader);
+    /* Туман по расстоянию до камеры, а не по глубине кадра: при повороте головы
+       деревья по краям экрана больше не «выплывают» из дымки. Поверх — лёгкая
+       экспоненциальная дымка, которая набирается ещё до основного тумана.
+       Аддитивные материалы (ореолы, пятна света) в туман не красятся, а гаснут. */
+    sh.fragmentShader = sh.fragmentShader.replace('#include <fog_fragment>', `#ifdef USE_FOG
+      vec3 nbV = vWPos - cameraPosition; float nbD = length(nbV);
+      float fogFactor = max(smoothstep(fogNear, fogFar, nbD), (1.0 - exp(-nbD*0.0017))*0.5);
+      ${o.additive ? 'gl_FragColor.rgb *= 1.0 - fogFactor;'
+        : 'gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor + uScatter*pow(max(dot(nbV/nbD, uSunDir), 0.0), 5.0), fogFactor);'}
+    #endif`);
+  };
+  // разные патчи обязаны давать разные программы: исходник у колбэка один и тот же
+  mat.customProgramCacheKey = ()=>'nb:'+(o.key||'');
+}
+// двусторонние листья и трава: нормаль не переворачиваем на изнанке,
+// иначе обратная сторона карточки чернеет
+const KEEP_NORMAL = s=>s.replace('#include <normal_fragment_begin>',
+  '#include <normal_fragment_begin>\nnormal = normalize(vNormal); nonPerturbedNormal = normal;');
+
+// небо: рассеяние, диск солнца, луна и облака — всё в одном шейдере
 const sky = new THREE.Mesh(
-  new THREE.SphereGeometry(1300, 24, 14),
+  new THREE.SphereGeometry(1300, 48, 24),
   new THREE.ShaderMaterial({
     side:THREE.BackSide, depthWrite:false, fog:false,
     uniforms:{ top:{value:DAY.sky.clone()}, bottom:{value:DAY.hor.clone()},
                sunCol:{value:DAY.sun.clone()}, sunDir:{value:new THREE.Vector3(0,1,0)},
-               glow:{value:1}, exposure:{value:renderer.toneMappingExposure} },
+               moonDir:{value:new THREE.Vector3(0,1,0)}, groundCol:{value:new THREE.Color(0x202818)},
+               glow:{value:1}, night:{value:0}, cover:{value:.58}, isEnv:{value:0}, uTime:U.uTime },
     /* Сфера ездит вместе с камерой, локальный центр всегда под глазом — значит
-       направление взгляда это нормаль от position, без модельной матрицы.
-       Через world-позицию оно бралось со смещением на координаты камеры, и у
-       края карты (±1152 при радиусе 1300) горизонт заметно перекашивало. */
+       направление взгляда это нормаль от position, без модельной матрицы. */
     vertexShader:`varying vec3 vDir; void main(){ vDir=position;
       gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
-    /* Ореол вокруг солнца: узкая часть — свечение у диска, широкая — засветка
-       полнеба. Обе прибавляются ДО aces(), иначе тон горизонта разъезжается
-       с туманом, который тональную компрессию проходит уже в рендерере. */
-    fragmentShader:`uniform vec3 top; uniform vec3 bottom; uniform vec3 sunCol;
-      uniform vec3 sunDir; uniform float glow; uniform float exposure; varying vec3 vDir;
-      vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
-      void main(){ vec3 d=normalize(vDir); float h=max(d.y,0.0);
-        vec3 c=mix(bottom,top,pow(h,0.55));
-        float s=max(dot(d,sunDir),0.0);
-        c+=sunCol*glow*(pow(s,64.0)*0.55+pow(s,7.0)*0.18);
-        gl_FragColor=vec4(aces(c*exposure),1.0); }`
+    /* Всё в линейной HDR-светимости: тональная компрессия и перевод в sRGB —
+       общие для всей сцены (чанки tonemapping/colorspace), поэтому горизонт
+       сходится с туманом. Диск солнца в разы ярче единицы — его ловит bloom. */
+    fragmentShader:`uniform vec3 top; uniform vec3 bottom; uniform vec3 sunCol; uniform vec3 sunDir;
+      uniform vec3 moonDir; uniform vec3 groundCol;
+      uniform float glow; uniform float night; uniform float cover; uniform float isEnv; uniform float uTime;
+      varying vec3 vDir;
+      float hash(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+      float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); vec2 u=f*f*(3.0-2.0*f);
+        return mix(mix(hash(i),hash(i+vec2(1,0)),u.x), mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),u.x), u.y); }
+      float fbm(vec2 p){ float s=0.0, a=0.5; for(int i=0;i<5;i++){ s+=a*vnoise(p); p=p*2.03+vec2(3.1,1.7); a*=0.5; } return s; }
+      void main(){
+        vec3 d=normalize(vDir); float h=d.y, hp=max(h,0.0);
+        vec3 c=mix(bottom, top, pow(hp,0.45));
+        float mu=dot(d,sunDir);
+        float g=0.8, hg=(1.0-g*g)/pow(1.0+g*g-2.0*g*mu,1.5)*0.0796;   // фаза Хеньи-Гринштейна
+        c += sunCol*glow*(hg*0.2 + pow(max(mu,0.0),5.0)*0.22);
+        c += sunCol*glow*smoothstep(0.99955,0.9998,mu)*(isEnv>0.5 ? 3.0 : 60.0);
+        float mm=dot(d,moonDir);
+        c += vec3(0.85,0.9,1.0)*smoothstep(0.99925,0.9995,mm)*night*(isEnv>0.5 ? 0.3 : 2.4);
+        c += vec3(0.20,0.26,0.40)*pow(max(mm,0.0),60.0)*night*0.3;
+        if(h>0.0){
+          vec2 uv=d.xz/(h+0.1)*0.9 + vec2(uTime*0.006, uTime*0.0025);
+          float n=fbm(uv*1.4)*0.8 + fbm(uv*4.3+7.0)*0.3;
+          float dens=smoothstep(cover, cover+0.22, n)*smoothstep(0.0,0.14,h);
+          float thick=smoothstep(cover, cover+0.55, n);
+          vec3 amb=mix(bottom, top, 0.35);
+          vec3 lit=sunCol*glow*(1.0+1.8*pow(max(mu,0.0),6.0)) + amb*0.55;
+          vec3 cc=mix(lit, amb*0.6 + sunCol*glow*0.1, thick*0.75);
+          cc=mix(cc, bottom*1.3 + vec3(0.003,0.004,0.007), night);
+          c=mix(c, cc, dens*0.92);
+        }
+        if(h<0.0) c = isEnv>0.5 ? mix(groundCol, bottom, exp(h*10.0)) : bottom;
+        gl_FragColor=vec4(c,1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`
   })
 );
 sky.frustumCulled = false; scene.add(sky);
+
+/* Карта окружения — то же небо, прогнанное через PMREM. Она даёт металлу и лаку
+   отражения, а всем остальным — рассеянный свет неба с правильной стороны.
+   Пересчитывается, только когда небо заметно поменялось (см. tick). */
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envScene = new THREE.Scene();
+envScene.add(new THREE.Mesh(new THREE.SphereGeometry(50,32,16), sky.material));
+let envRT=null;
+function updateEnv(){
+  sky.material.uniforms.isEnv.value=1;
+  const rt=pmrem.fromScene(envScene, 0, 0.1, 100, {size:128});
+  sky.material.uniforms.isEnv.value=0;
+  scene.environment=rt.texture;
+  if(envRT) envRT.dispose();
+  envRT=rt;
+}
 
 // звёзды (проявляются ночью)
 const STARS=600;
@@ -673,67 +1007,26 @@ const starMat = new THREE.PointsMaterial({color:0xE8F0FF,size:2.6,sizeAttenuatio
   transparent:true,opacity:0,fog:false,vertexColors:true});
 const stars = new THREE.Points(starGeo, starMat); stars.frustumCulled=false; scene.add(stars);
 
-/* Ключ и заполнение днём — 2.8 к 0.7, то есть 4:1.
-   При прежних 2.1 к 1.15 (меньше двух) затенённый бок был почти той же светлоты,
-   что освещённый: ясный полдень выглядел как ровная облачность. Ночные значения
-   у обоих источников те же, что были, — правится только дневной конец шкалы,
-   парой с lerp() в tick(). */
-const hemi = new THREE.HemisphereLight(0x9FC0E0, 0x4C6136, 0.7); scene.add(hemi);
-const sun  = new THREE.DirectionalLight(0xFFF1D6, 2.8);
+/* Заполняющий свет теперь в основном даёт карта окружения (рассеянный свет
+   неба). Полусфера оставлена слабой — это отражённый от травы зеленоватый
+   подсвет снизу и ночная «читаемость» земли. */
+const hemi = new THREE.HemisphereLight(0x9FC0E0, 0x4C6136, 0.3); scene.add(hemi);
+const sun  = new THREE.DirectionalLight(0xFFF1D6, 3.2);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048,2048);
-sun.shadow.camera.near = 1; sun.shadow.camera.far = 260;
-sun.shadow.camera.left=-72; sun.shadow.camera.right=72;
-sun.shadow.camera.top=72;  sun.shadow.camera.bottom=-72;
-/* Константный bias сдвигает тень для всей сцены одинаково, поэтому его хватает
-   ровно до тех пор, пока не начнёт отрывать тень от подошвы объекта. normalBias
-   отодвигает точку выборки вдоль нормали — величина сдвига зависит от наклона
-   грани, так что рябь на пологом рельефе уходит без потери контакта. Теперь,
-   когда тени стали глубже, отрыв было бы видно. */
-sun.shadow.bias = -0.0005;
-sun.shadow.normalBias = 0.035;
-/* Плотность падающей тени — от столбов, машины, деревьев, домов, всего.
-   В шейдере это mix(1.0, shadow, intensity), то есть 0.5 — ровно вдвое светлее.
-   Отдельный параметр удобнее правки света: сила солнца и глубина тени
-   развязаны, контраст 4:1 остаётся, а тени перестают быть провалами. */
-sun.shadow.intensity = 0.5;
+sun.shadow.mapSize.set(4096,4096);
+sun.shadow.camera.near = 1; sun.shadow.camera.far = 320;
+sun.shadow.camera.left=-95; sun.shadow.camera.right=95;
+sun.shadow.camera.top=95;  sun.shadow.camera.bottom=-95;
+/* normalBias отодвигает точку выборки вдоль нормали — рябь на пологом рельефе
+   уходит без отрыва тени от подошвы объекта. */
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.045;
+sun.shadow.radius = 2.4;
+/* Плотность падающей тени. Раньше тень специально осветляли вдвое, потому что
+   заполнения не было; теперь затенённое честно подсвечено небом (IBL), и
+   тень можно держать почти полной — как в ясный день. */
+sun.shadow.intensity = 0.9;
 scene.add(sun); scene.add(sun.target);
-
-/* ============================================================
-   3b. ЗАДНИК: облака и светила — следуют за камерой
-   ============================================================ */
-const backdrop = new THREE.Group(); scene.add(backdrop);
-
-// облачный слой
-const clouds=[];
-let cloudMat;                     // подкрашивается в цикле кадра вместе с горизонтом
-{
-  const c=document.createElement('canvas'); c.width=c.height=256;
-  const g=c.getContext('2d');
-  for(let i=0;i<26;i++){
-    const x=20+Math.random()*216, y=60+Math.random()*136, r=18+Math.random()*46;
-    const gr=g.createRadialGradient(x,y,0,x,y,r);
-    gr.addColorStop(0,'rgba(255,255,255,.55)'); gr.addColorStop(1,'rgba(255,255,255,0)');
-    g.fillStyle=gr; g.beginPath(); g.arc(x,y,r,0,6.283); g.fill();
-  }
-  const tex=new THREE.CanvasTexture(c);
-  const mat=new THREE.MeshBasicMaterial({map:tex,transparent:true,opacity:.6,depthWrite:false,fog:false});
-  for(let i=0;i<8;i++){
-    const m=new THREE.Mesh(new THREE.PlaneGeometry(760,420),mat);
-    m.rotation.x=-Math.PI/2; m.rotation.z=Math.random()*6.283;
-    m.position.set((Math.random()*2-1)*900, 210+Math.random()*90, (Math.random()*2-1)*900);
-    m.frustumCulled=false; backdrop.add(m); clouds.push(m);
-  }
-  cloudMat=mat;
-}
-
-// диски солнца и луны
-const sunDisc = new THREE.Sprite(new THREE.SpriteMaterial({color:0xFFF6DC,transparent:true,
-  blending:THREE.AdditiveBlending,depthWrite:false,fog:false}));
-sunDisc.scale.set(150,150,1); backdrop.add(sunDisc);
-const moonDisc= new THREE.Sprite(new THREE.SpriteMaterial({color:0xCBDCFF,transparent:true,
-  blending:THREE.AdditiveBlending,depthWrite:false,fog:false,opacity:0}));
-moonDisc.scale.set(80,80,1); backdrop.add(moonDisc);
 
 /* ============================================================
    4. МИР: рельеф, дороги, разметка, объекты (InstancedMesh)
@@ -768,17 +1061,92 @@ function nearColliders(x, z, fn){
   return false;
 }
 
+/* --- геометрические помощники --- */
+// склейка геометрий в одну (без индексов) — на одну отрисовку вместо нескольких
+function mergeGeos(list){
+  const parts=list.map(g=>g.index?g.toNonIndexed():g);
+  const out=new THREE.BufferGeometry();
+  for(const n of ['position','normal','uv','color']){
+    if(!parts.every(p=>p.attributes[n])) continue;
+    const size=parts[0].attributes[n].itemSize;
+    const arr=new Float32Array(parts.reduce((a,p)=>a+p.attributes[n].count*size,0));
+    let o=0; for(const p of parts){ arr.set(p.attributes[n].array,o); o+=p.attributes[n].array.length; }
+    out.setAttribute(n,new THREE.BufferAttribute(arr,size));
+  }
+  return out;
+}
+// постоянный цвет вершин (или функция от позиции) — вершинная «запечённая» тень
+function vcol(geo, fn){
+  const p=geo.attributes.position, c=new Float32Array(p.count*3);
+  for(let i=0;i<p.count;i++){ const v=typeof fn==='function'?fn(p.getX(i),p.getY(i),p.getZ(i)):fn;
+    c[i*3]=v[0]; c[i*3+1]=v[1]; c[i*3+2]=v[2]; }
+  geo.setAttribute('color',new THREE.BufferAttribute(c,3)); return geo;
+}
+// комковатость: сумма синусов в случайных направлениях сдвигает вершины по радиусу
+function lumpy(geo, amp, seed){
+  const r=mulberry32(seed), waves=[];
+  for(let i=0;i<6;i++){ const th=r()*6.283, ph=Math.acos(r()*2-1), f=1.4+r()*3.4;
+    waves.push([Math.sin(ph)*Math.cos(th)*f, Math.cos(ph)*f, Math.sin(ph)*Math.sin(th)*f, r()*6.283, amp/(1+i*.5)]); }
+  const p=geo.attributes.position, v=new THREE.Vector3();
+  for(let i=0;i<p.count;i++){ v.fromBufferAttribute(p,i); const len=v.length()||1;
+    let d=0; for(const [a,b,c,ph,am] of waves) d+=Math.sin(v.x*a+v.y*b+v.z*c+ph)*am;
+    v.multiplyScalar((len+d)/len); p.setXYZ(i,v.x,v.y,v.z); }
+  return geo;
+}
+// сглаженные нормали для геометрии без индексов (склейка по совпадающим позициям)
+function smoothNormals(geo){
+  geo.computeVertexNormals();
+  const p=geo.attributes.position, n=geo.attributes.normal, acc=new Map();
+  const k=i=>Math.round(p.getX(i)*1e3)+','+Math.round(p.getY(i)*1e3)+','+Math.round(p.getZ(i)*1e3);
+  for(let i=0;i<p.count;i++){ const kk=k(i); let a=acc.get(kk); if(!a){ a=[0,0,0]; acc.set(kk,a); }
+    a[0]+=n.getX(i); a[1]+=n.getY(i); a[2]+=n.getZ(i); }
+  for(let i=0;i<p.count;i++){ const a=acc.get(k(i)), l=Math.hypot(a[0],a[1],a[2])||1; n.setXYZ(i,a[0]/l,a[1]/l,a[2]/l); }
+  return geo;
+}
+// сглаживание с порогом: грани, сходящиеся под углом меньше crease, делят нормаль,
+// острее — остаются рёбрами. Для кузова: фаски и арки гладкие, борт и капот — нет
+function creaseNormals(geo, crease=.6){
+  geo.computeVertexNormals();
+  const p=geo.attributes.position, n=geo.attributes.normal, fn=n.array.slice(), groups=new Map(), c=Math.cos(crease);
+  const k=i=>Math.round(p.getX(i)*1e3)+","+Math.round(p.getY(i)*1e3)+","+Math.round(p.getZ(i)*1e3);
+  for(let i=0;i<p.count;i++){ const kk=k(i); if(!groups.has(kk)) groups.set(kk,[]); groups.get(kk).push(i); }
+  for(const ids of groups.values()) for(const i of ids){
+    let x=0,y=0,z=0;
+    for(const j of ids){ const d=fn[i*3]*fn[j*3]+fn[i*3+1]*fn[j*3+1]+fn[i*3+2]*fn[j*3+2];
+      if(d>=c){ x+=fn[j*3]; y+=fn[j*3+1]; z+=fn[j*3+2]; } }
+    const l=Math.hypot(x,y,z)||1; n.setXYZ(i,x/l,y/l,z/l);
+  }
+  return geo;
+}
+// «сферические» нормали кроны: свет ложится на крону как на один мягкий объём
+function sphereNormals(geo, cx,cy,cz, sy=1, mix=1){
+  const p=geo.attributes.position, n=geo.attributes.normal, v=new THREE.Vector3(), g=new THREE.Vector3();
+  for(let i=0;i<p.count;i++){
+    v.set(p.getX(i)-cx,(p.getY(i)-cy)/sy,p.getZ(i)-cz).normalize();
+    g.set(n.getX(i),n.getY(i),n.getZ(i)).lerp(v,mix).normalize();
+    n.setXYZ(i,g.x,g.y,g.z);
+  }
+  return geo;
+}
+const scaleUV=(geo,su,sv)=>{ const uv=geo.attributes.uv; for(let i=0;i<uv.count;i++) uv.setXY(i,uv.getX(i)*su,uv.getY(i)*sv); return geo; };
+// детерминированный хеш координат: вариации облика без обращения к rnd()
+const hash01=(a,b)=>((((a*73856093)^(b*19349663))>>>0)%1000)/1000;
+const hashXZ=(x,z,salt=0)=>hash01(Math.round(x*10)+salt*7919, Math.round(z*10)-salt*104729);
+
 /* --- рельеф: собственная геометрия из сетки H --- */
 {
-  const N=SEG+1, pos=new Float32Array(N*N*3), col=new Float32Array(N*N*3), idx=[];
-  const grass1=new THREE.Color(0x5C8A3C), grass2=new THREE.Color(0x74A24A),
-        dirt=new THREE.Color(0x8A7A4E), c=new THREE.Color();
+  const N=SEG+1, pos=new Float32Array(N*N*3), col=new Float32Array(N*N*3), uv=new Float32Array(N*N*2), idx=[];
+  const grass1=new THREE.Color(0x4A7429), grass2=new THREE.Color(0x6A9140), dry=new THREE.Color(0x9C9150),
+        dirt=new THREE.Color(0x7E6C4A), c=new THREE.Color();
   for(let j=0;j<N;j++) for(let i=0;i<N;i++){
     const k=j*N+i, x=-MAP+i*CELL, z=-MAP+j*CELL, y=H[k];
     pos[k*3]=x; pos[k*3+1]=y; pos[k*3+2]=z;
+    uv[k*2]=x/7; uv[k*2+1]=z/7;
     const n=(Math.sin(x*0.013)*Math.cos(z*0.017)+1)/2;
-    c.copy(grass1).lerp(grass2,n).lerp(dirt, smooth(0,1,roadMask(x,z))*0.6);
-    c.offsetHSL(0,0,(y>4?0.05:0)+(n-.5)*0.03);
+    const n2=(Math.sin(x*0.0061+1.3)*Math.cos(z*0.0049-0.4)+1)/2;
+    c.copy(grass1).lerp(grass2,n).lerp(dry, smooth(.6,.95,n2)*.4)
+     .lerp(dirt, smooth(0,1,roadMask(x,z))*0.6);
+    c.offsetHSL(0,0,(y>4?0.04:0)+(n-.5)*0.03);
     col[k*3]=c.r; col[k*3+1]=c.g; col[k*3+2]=c.b;
   }
   // диагональ a-c — ровно та же, что в heightAt()
@@ -789,8 +1157,19 @@ function nearColliders(x, z, fn){
   const g=new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos,3));
   g.setAttribute('color',    new THREE.BufferAttribute(col,3));
+  g.setAttribute('uv',       new THREE.BufferAttribute(uv,2));
   g.setIndex(idx); g.computeVertexNormals();
-  const ground=new THREE.Mesh(g, wet(new THREE.MeshLambertMaterial({vertexColors:true, flatShading:true})));
+  /* Гладкие нормали вместо плоских граней и травяная деталь двумя масштабами:
+     второй слой с другим шагом прячет повтор плитки на открытом поле. */
+  const m=wet(new THREE.MeshStandardMaterial({vertexColors:true, map:TEX.grass, normalMap:TEX.grassN,
+    normalScale:new THREE.Vector2(.9,.9), roughness:.96, metalness:0}));
+  m.userData.nbOpt={key:'ground', frag:s=>s
+    .replace('#include <map_fragment>', `#ifdef USE_MAP
+      vec4 nbA = texture2D(map, vMapUv), nbB = texture2D(map, vMapUv*0.23 + vec2(0.31,0.73));
+      diffuseColor *= mix(nbA, nbB, 0.5) * 1.3;
+    #endif`)
+    .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.5, uWet);')};
+  const ground=new THREE.Mesh(g, m);
   ground.receiveShadow=true;
   world.add(ground);
 }
@@ -798,9 +1177,11 @@ function nearColliders(x, z, fn){
 /* --- дороги: асфальт + гравийная кромка + краевая разметка --- */
 {
   const STEPS=SEG/2, step=CELL*2;
-  // универсальный построитель ленты между двумя боковыми смещениями
-  function ribbon(cols, yOff){
-    const positions=[], indices=[]; let v=0;
+  // универсальный построитель ленты между двумя боковыми смещениями.
+  // axis: 'x' — ленты вдоль Z (линия x=const), 'z' — вдоль X
+  function ribbon(cols, yOff, vLen, axes){
+    const positions=[], uvs=[], indices=[]; let v=0;
+    const w0=cols[0], w1=cols[cols.length-1];
     const line=(axis,fixed)=>{
       const base=v;
       for(let i=0;i<=STEPS;i++){
@@ -808,7 +1189,7 @@ function nearColliders(x, z, fn){
         for(const s of cols){
           const x = axis==='x' ? fixed+s : t;
           const z = axis==='x' ? t : fixed+s;
-          positions.push(x, heightAt(x,z)+yOff, z); v++;
+          positions.push(x, heightAt(x,z)+yOff, z); uvs.push((s-w0)/(w1-w0), t/vLen); v++;
         }
       }
       for(let i=0;i<STEPS;i++) for(let c=0;c<cols.length-1;c++){
@@ -816,35 +1197,78 @@ function nearColliders(x, z, fn){
         indices.push(a,cc,b, b,cc,d);
       }
     };
-    for(let f=-MAP; f<=MAP; f+=ROAD_STEP){ line('x',f); line('z',f); }
+    for(let f=-MAP; f<=MAP; f+=ROAD_STEP) for(const ax of axes) line(ax,f);
     const g=new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs,2));
     g.setIndex(indices); g.computeVertexNormals();
     return g;
   }
-  const mat=(c,extra={})=>wet(new THREE.MeshLambertMaterial(Object.assign({
-    color:c, side:THREE.DoubleSide, flatShading:true,
-    polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2}, extra)));
+  const decal=(extra, off=-2)=>wet(new THREE.MeshStandardMaterial(Object.assign({
+    side:THREE.DoubleSide, polygonOffset:true, polygonOffsetFactor:off, polygonOffsetUnits:off}, extra)));
 
-  const gravelMat=mat(0x8A7B5C);
+  // мелкий щебень: плитка 1.6 м, по ширине обочины дважды
+  TEX.gravel.repeat.set(2,1); TEX.gravelN.repeat.set(2,1);
+  const gravelMat=decal({map:TEX.gravel, normalMap:TEX.gravelN, roughness:1, color:0xC9BCA0});
+  gravelMat.userData.nbOpt={key:'gravel', frag:s=>s.replace('#include <roughnessmap_fragment>',
+    '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.55, uWet);')};
   [[-ROAD_HALF-3.2,-ROAD_HALF],[ROAD_HALF,ROAD_HALF+3.2]].forEach(cols=>{
-    const m=new THREE.Mesh(ribbon(cols,0.10), gravelMat);
+    const m=new THREE.Mesh(ribbon(cols,0.10,1.6,['x','z']), gravelMat);
     m.receiveShadow=true; world.add(m);
   });
 
-  const road=new THREE.Mesh(ribbon([-ROAD_HALF,0,ROAD_HALF],0.14), mat(0x535353));
-  road.receiveShadow=true; world.add(road);
+  /* Асфальт: колея (R), шероховатость (G) и лужи (B) в одной текстуре.
+     На перекрёстке колея гаснет — там машины едут во все стороны. В дождь
+     шероховатость падает, в колее и на лужах почти до зеркала, и полотно
+     начинает отражать небо и фары. Ленты вдоль X и вдоль Z — отдельные меши
+     с разным смещением глубины: на перекрёстке одна всегда поверх другой,
+     без мерцания двух совпадающих плоскостей. */
+  const roadOpt={key:'road', frag:s=>s
+    .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+      float nbInter = 1.0 - smoothstep(${ROAD_HALF}.0, ${ROAD_HALF+7}.0, max(nbGrid(vWPos.x), nbGrid(vWPos.z)));
+      vec4 nbOrm = texture2D(roughnessMap, vRoughnessMapUv);
+      float nbWear = nbOrm.r*(1.0 - nbInter);
+      diffuseColor.rgb *= 1.0 - nbWear*0.3;
+      roughnessFactor = clamp(roughnessFactor - nbWear*0.2, 0.0, 1.0);
+      float nbPud = smoothstep(0.45, 0.75, nbOrm.b + nbWear*0.15);
+      roughnessFactor = mix(roughnessFactor, mix(0.3, 0.03, nbPud), uWet);
+      diffuseColor.rgb *= 1.0 - uWet*(0.15 + nbPud*0.3);`)
+    .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+      normal = normalize(mix(normal, nonPerturbedNormal, uWet*nbPud));`)};
+  const roadTex={map:TEX.asphalt, roughnessMap:TEX.asphaltORM, normalMap:TEX.asphaltN,
+    normalScale:new THREE.Vector2(.7,.7), roughness:1, color:0xB0B0B0};
+  const roadA=decal(roadTex,-2), roadB=decal(roadTex,-3);
+  roadA.userData.nbOpt=roadB.userData.nbOpt=roadOpt;
+  [[roadA,'x'],[roadB,'z']].forEach(([m,ax])=>{
+    const r=new THREE.Mesh(ribbon([-ROAD_HALF,0,ROAD_HALF],0.14,36,[ax]), m);
+    r.receiveShadow=true; world.add(r);
+  });
 
-  const lineMat=mat(0xCFCABA);
+  // краевые линии обрываются у перекрёстка, а не прочерчивают его насквозь
+  const lineMat=decal({color:0xE2DED2, roughness:.62},-4);
+  lineMat.userData.nbOpt={key:'edge', frag:s=>s.replace('#include <alphatest_fragment>',
+    `#include <alphatest_fragment>
+     if(max(nbGrid(vWPos.x), nbGrid(vWPos.z)) < ${(ROAD_HALF+1.5).toFixed(1)}) discard;`)
+    .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.15, uWet);')};
   [[-ROAD_HALF+0.7,-ROAD_HALF+1.2],[ROAD_HALF-1.2,ROAD_HALF-0.7]].forEach(cols=>{
-    world.add(new THREE.Mesh(ribbon(cols,0.20), lineMat));
+    const m=new THREE.Mesh(ribbon(cols,0.20,1,['x','z']), lineMat); m.receiveShadow=true; world.add(m);
   });
 }
 
 /* --- разметка --- */
 {
-  const dash=new THREE.BoxGeometry(0.42,0.05,3.2);
-  const mat=new THREE.MeshBasicMaterial({color:0xD9D4C4});
+  /* Штрих — тонкая пластина заподлицо с асфальтом. Высота берётся так же, как
+     у ленты дороги: линейно между опорными точками через 24 м, а не по рельефу —
+     иначе на уклоне штрих то тонет, то висит ступенькой. */
+  const dash=new THREE.BoxGeometry(0.42,0.02,3.2);
+  const mat=new THREE.MeshStandardMaterial({color:0xE2DED2, roughness:.62, polygonOffset:true,
+    polygonOffsetFactor:-4, polygonOffsetUnits:-4});
+  mat.userData.nbOpt={key:'dash', frag:s=>s.replace('#include <roughnessmap_fragment>',
+    '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.15, uWet);')};
+  const RSTEP=CELL*2;
+  const roadY=(t,f,alongZ)=>{ const i=Math.floor((t+MAP)/RSTEP), u=(t+MAP)/RSTEP-i, t0=-MAP+i*RSTEP;
+    const h=(tt)=>alongZ?heightAt(f,tt):heightAt(tt,f);
+    return lerp(h(t0),h(t0+RSTEP),u); };
   const items=[];
   for(let f=-MAP; f<=MAP; f+=ROAD_STEP){
     for(let t=-MAP; t<MAP; t+=22){
@@ -853,12 +1277,114 @@ function nearColliders(x, z, fn){
     }
   }
   const m=new THREE.InstancedMesh(dash,mat,items.length), d=new THREE.Object3D();
-  items.forEach(([x,z,ry],i)=>{ d.position.set(x,heightAt(x,z)+0.26,z); d.rotation.set(0,ry,0);
+  d.rotation.order='YXZ';
+  items.forEach(([x,z,ry],i)=>{
+    const alongZ=ry===0, t=alongZ?z:x, f=alongZ?x:z;
+    const h0=roadY(t-1.6,f,alongZ), h1=roadY(t+1.6,f,alongZ);
+    d.position.set(x,(h0+h1)/2+0.16,z);
+    // YXZ: наклон вокруг поперечной оси штриха, затем разворот по курсу дороги;
+    // у штриха вдоль X локальный +z смотрит в +X, отсюда знак уклона
+    d.rotation.set(-Math.atan2(h1-h0,3.2),ry,0);
     d.updateMatrix(); m.setMatrixAt(i,d.matrix); });
-  m.instanceMatrix.needsUpdate=true; world.add(m);
+  m.instanceMatrix.needsUpdate=true; m.receiveShadow=true; world.add(m);
 }
 
-/* --- вспомогательная фабрика инстансов --- */
+/* --- трава: пучки травинок на GPU вокруг машины ---
+   Один набор пучков лежит в квадрате T×T. Каждый пучок в вершинном шейдере
+   переносится на целое число квадратов так, чтобы оказаться рядом с центром —
+   поле «едет» за машиной, но отдельная травинка стоит на месте, пока не уйдёт
+   за край. Высота берётся из той же сетки H и тем же треугольником, что
+   heightAt(), — травинки не висят и не тонут. На дороге, обочине и у АЗС травы нет. */
+const GRASS_T=104, GRASS_MAX=48000;
+const grass=(()=>{
+  const pos=[], idx=[], nrm=[];
+  for(let b=0;b<3;b++){
+    const a=b*2.094+.4, ca=Math.cos(a), sa=Math.sin(a), ox=(b-1)*.06, oz=((b*7)%3-1)*.05;
+    const base=pos.length/3, SEGS=4;
+    for(let k=0;k<SEGS;k++){ const t=k/SEGS, w=.065*(1-t*.8);
+      pos.push(ox-ca*w,t,oz-sa*w, ox+ca*w,t,oz+sa*w); nrm.push(0,1,0, 0,1,0); }
+    pos.push(ox,1,oz); nrm.push(0,1,0);
+    for(let k=0;k<SEGS-1;k++){ const i=base+k*2; idx.push(i,i+1,i+2, i+1,i+3,i+2); }
+    const i=base+(SEGS-1)*2; idx.push(i,i+1,i+2);
+  }
+  const g=new THREE.InstancedBufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm,3));
+  g.setIndex(idx);
+  const gr=mulberry32(777), off=new Float32Array(GRASS_MAX*2), rr=new Float32Array(GRASS_MAX*4);
+  for(let i=0;i<GRASS_MAX;i++){
+    off[i*2]=(gr()-.5)*GRASS_T; off[i*2+1]=(gr()-.5)*GRASS_T;
+    rr[i*4]=gr(); rr[i*4+1]=.35+gr()*.6; rr[i*4+2]=gr(); rr[i*4+3]=gr()-.5;
+  }
+  g.setAttribute('aOff', new THREE.InstancedBufferAttribute(off,2));
+  g.setAttribute('aRnd', new THREE.InstancedBufferAttribute(rr,4));
+  g.instanceCount=GRASS_MAX;
+  const hTex=new THREE.DataTexture(H, SEG+1, SEG+1, THREE.RedFormat, THREE.FloatType);
+  hTex.needsUpdate=true;
+  const mat=wet(new THREE.MeshStandardMaterial({color:0xFFFFFF, roughness:.8, side:THREE.DoubleSide}));
+  const uni={uGC:{value:new THREE.Vector2()}, uHeight:{value:hTex}, uStation:{value:new THREE.Vector2(1e5,1e5)}};
+  mat.userData.nbOpt={key:'grass', uniforms:uni,
+    vDecl:`attribute vec2 aOff; attribute vec4 aRnd; uniform vec2 uGC; uniform sampler2D uHeight;
+      uniform vec2 uStation; varying vec3 vGrass;
+      float nbH(int i,int j){ return texelFetch(uHeight, ivec2(clamp(i,0,${SEG}), clamp(j,0,${SEG})), 0).r; }
+      float terrainH(vec2 p){
+        float fx=(p.x+${MAP}.0)/${CELL}.0, fz=(p.y+${MAP}.0)/${CELL}.0, ix=floor(fx), iz=floor(fz);
+        int i=int(ix), j=int(iz); float u=fx-ix, v=fz-iz;
+        float h00=nbH(i,j), h10=nbH(i+1,j), h11=nbH(i+1,j+1), h01=nbH(i,j+1);
+        return u>=v ? h00+(h10-h00)*u+(h11-h10)*v : h00+(h11-h01)*u+(h01-h00)*v;
+      }`,
+    vert:s=>s.replace('#include <begin_vertex>', `
+      vec2 nbC = aOff + ${GRASS_T}.0*floor((uGC - aOff)/${GRASS_T}.0 + 0.5);
+      float nbS = aRnd.y
+        * (1.0 - smoothstep(${(GRASS_T*0.28).toFixed(1)}, ${(GRASS_T*0.5).toFixed(1)}, length(nbC - uGC)))
+        * smoothstep(${(ROAD_HALF+3.4).toFixed(1)}, ${ROAD_HALF+8}.0, min(nbGrid(nbC.x), nbGrid(nbC.y)))
+        * smoothstep(11.0, 14.0, length(nbC - uStation));
+      float nbPatch = 0.6 + 0.5*sin(nbC.x*0.071 + sin(nbC.y*0.05)*2.0)*sin(nbC.y*0.083 + 1.3);
+      nbS *= clamp(nbPatch, 0.3, 1.0);
+      float nbA = aRnd.x*6.2832, ca = cos(nbA), sa = sin(nbA);
+      vec3 nbP = position;
+      nbP.xz = vec2(ca*nbP.x - sa*nbP.z, sa*nbP.x + ca*nbP.z) * (0.7 + nbS*0.6);
+      nbP.y *= nbS;
+      float nbWind = sin(uTime*1.6 + nbC.x*0.12 + nbC.y*0.09)*0.6 + sin(uTime*2.9 + nbC.x*0.5)*0.22;
+      float nbBend = position.y*position.y*nbS;
+      nbP.x += (nbWind*0.24 + aRnd.w*0.3)*nbBend;
+      nbP.z += (nbWind*0.1 - aRnd.w*0.15)*nbBend;
+      vec3 transformed = vec3(nbC.x + nbP.x, terrainH(nbC) + nbP.y - 0.05, nbC.y + nbP.z);
+      vec3 nbTip = mix(vec3(0.075,0.15,0.028), vec3(0.16,0.15,0.055), aRnd.z*aRnd.z);
+      vGrass = mix(vec3(0.022,0.045,0.01), nbTip, smoothstep(0.0, 1.0, position.y));`)
+      .replace('#include <beginnormal_vertex>', 'vec3 objectNormal = vec3(0.0, 1.0, 0.0);'),
+    fDecl:'varying vec3 vGrass;',
+    frag:s=>KEEP_NORMAL(s).replace('#include <color_fragment>', 'diffuseColor.rgb *= vGrass;')};
+  const m=new THREE.Mesh(g,mat);
+  m.frustumCulled=false; m.receiveShadow=true; m.castShadow=false;
+  m.userData.uni=uni;
+  world.add(m); return m;
+})();
+
+/* --- раскладка статики по чанкам ---
+   Раньше каждый вид объектов был одним InstancedMesh на всю карту: его сфера
+   охватывала всё, и в каждый кадр и в каждый проход теней рисовались все 2600
+   деревьев. Теперь инстансы разложены по квадратам 288×288: невидимые чанки
+   отсекает фрустум (и камеры, и солнца), а дальние — дистанция в tick(). */
+const CH=288, chunkList=[];
+function chunked(geo, mat, list, {cast=true, receive=true, colors=null}={}){
+  const buckets=new Map(), d=new THREE.Object3D();
+  list.forEach((o,i)=>{ const k=key(Math.floor(o.x/CH),Math.floor(o.z/CH));
+    if(!buckets.has(k)) buckets.set(k,[]); buckets.get(k).push(i); });
+  for(const ids of buckets.values()){
+    const m=new THREE.InstancedMesh(geo, mat, ids.length);
+    let cx=0, cz=0;
+    ids.forEach((li,j)=>{ const o=list[li];
+      d.position.set(o.x,o.y,o.z); d.rotation.set(o.rx||0,o.ry||0,o.rz||0);
+      d.scale.set(o.s||1, o.sy||o.s||1, o.s||1); d.updateMatrix(); m.setMatrixAt(j,d.matrix);
+      if(colors) m.setColorAt(j, colors[li]);
+      cx+=o.x; cz+=o.z; });
+    m.castShadow=cast; m.receiveShadow=receive; m.computeBoundingSphere();
+    m.userData.cx=cx/ids.length; m.userData.cz=cz/ids.length;
+    world.add(m); chunkList.push(m);
+  }
+}
+/* --- вспомогательная фабрика инстансов (для немногочисленных объектов) --- */
 function instanced(geo, mat, list, shadow=true){
   const m=new THREE.InstancedMesh(geo, mat, Math.max(list.length,1));
   const d=new THREE.Object3D();
@@ -892,8 +1418,7 @@ function radialTexture(inner, outer, power){
 }
 const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
 {
-  const trunks=[], crowns=[], rocks=[], walls=[], roofs=[], bushes=[],
-        poles=[], heads=[], signPoles=[], signPlates=[],
+  const trees=[], rocks=[], walls=[], bushes=[], lamps=[], signs=[],
         winLit=[], winDark=[], doors=[];
 
   // деревья (вне дорог)
@@ -901,8 +1426,7 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
     const x=(rnd()*2-1)*MAP, z=(rnd()*2-1)*MAP;
     if(Math.min(gridDist(x),gridDist(z))<22) continue;
     const y=heightAt(x,z), s=.8+rnd()*.9, ry=rnd()*6.28;
-    trunks.push({x,y:y+1.5*s,z,s:s*.55,sy:s*3,ry});
-    crowns.push({x,y:y+4.2*s,z,s:s*2.6,ry});
+    trees.push({x,y:y-.15,z,s,ry});
     spots.push({x,y:y+0.07,z,s:s*4.4,rx:-Math.PI/2});
     addCollider({x,z,r:1.6*s});
   }
@@ -911,14 +1435,11 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
     const x=(rnd()*2-1)*MAP, z=(rnd()*2-1)*MAP;
     if(onPavement(x,z,ROAD_HALF+9)) continue;
     const s=.7+rnd()*1.6;
-    rocks.push({x,y:heightAt(x,z)+s*.45,z,s,ry:rnd()*6.28,rx:rnd()*.6});
+    rocks.push({x,y:heightAt(x,z)+s*.25,z,s,ry:rnd()*6.28,rx:rnd()*.6});
     spots.push({x,y:heightAt(x,z)+0.07,z,s:s*2.2,rx:-Math.PI/2});
     addCollider({x,z,r:s*.9});
   }
   // дома: деревни вокруг перекрёстков + одиночные хутора вдоль дорог
-  /* Ставни зажигаются не у всех окон. Выбор идёт хешем от координат, а не через
-     rnd(): лишний вызов сдвинул бы поток ГПСЧ и перетасовал весь мир после домов. */
-  const hash01=(a,b)=>((((a*73856093)^(b*19349663))>>>0)%1000)/1000;
   const house=(x,z,vertical)=>{
     if(Math.abs(x)>MAP-30||Math.abs(z)>MAP-30) return;
     if(onPavement(x,z,ROAD_HALF+7)) return;
@@ -927,14 +1448,12 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
     // мировые полуразмеры берутся перестановкой, без тригонометрии
     const halfX=(vertical?3:3.5)*s, halfZ=(vertical?3.5:3)*s;
     /* Дом занимает до 11×13 юнитов — больше ячейки рельефа (12), а heightAt()
-       возвращает высоту одной точки. На склоне углы уходят ниже центра, и дом
-       висит над землёй. Сажаем по минимуму высоты в пределах пятна: нижний угол
-       касается земли, верхний уходит в грунт и читается как фундамент. */
+       возвращает высоту одной точки. Сажаем по минимуму высоты в пределах пятна:
+       нижний угол касается земли, верхний уходит в грунт и читается как фундамент. */
     let base=Infinity;
     for(let a=-1;a<=1;a++) for(let b=-1;b<=1;b++)
       base=Math.min(base, heightAt(x+a*halfX, z+b*halfZ));
     walls.push({x,y:base+2.2,z,s,sy:1,ry});
-    roofs.push({x,y:base+4.35+1.3,z,s:s*1.15,sy:1,ry:ry+Math.PI/4});
     // пятно остаётся на высоте земли под центром — это декаль на рельефе, не на доме
     spots.push({x,y:heightAt(x,z)+0.07,z,s:w*1.7,rx:-Math.PI/2});
     addCollider({x,z,r:w*.62});
@@ -945,8 +1464,8 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
     const frontX=Math.abs(toX)<Math.abs(toZ) ? (Math.sign(toX)||1) : 0;
     const frontZ=frontX ? 0 : (Math.sign(toZ)||1);
     /* Грани коробки: [нормаль x, нормаль z, вынос до плоскости, полуширина грани,
-       разворот накладки]. Накладка сделана тонкой пластиной, смотрящей в +z,
-       поворот вокруг Y уводит её местный +z в нужную сторону. */
+       разворот накладки]. Накладка смотрит в +z, поворот вокруг Y уводит её
+       местный +z в нужную сторону. */
     const faces=[[1,0,halfX,halfZ,Math.PI/2], [-1,0,halfX,halfZ,-Math.PI/2],
                  [0,1,halfZ,halfX,0],         [0,-1,halfZ,halfX,Math.PI]];
     for(const [nx,nz,out,tanHalf,ang] of faces){
@@ -954,8 +1473,7 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
       const front = nx===frontX && nz===frontZ;
       /* Основание взято по низшей точке пятна, поэтому с нагорной стороны стена
          частично в грунте — там накладки надо поднять до местной земли, иначе
-         дверь закапывается (у 8% фасадов больше чем наполовину). Потолки разные:
-         дверь упирается в верх стены на 2.3, окно — уже на 1.05. */
+         дверь закапывается. Дверь упирается в верх стены на 2.3, окно — на 1.05. */
       const rise=heightAt(ox,oz)-base;
       if(front) doors.push({x:ox,y:base+clamp(rise,0,2.0)+1.05,z:oz,ry:ang,s:1});
       const winY=base+clamp(rise,0,1.0)+2.9;
@@ -993,20 +1511,20 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
       if(Math.abs(x)>MAP||Math.abs(z)>MAP) continue;
       if(onPavement(x,z,ROAD_HALF+7)) continue;
       const s=0.85+rnd()*1.15;
-      bushes.push({x,y:heightAt(x,z)+s*0.46,z,s,sy:s*0.7,ry:rnd()*6.28});
+      bushes.push({x,y:heightAt(x,z)+s*0.3,z,s,sy:s*0.7,ry:rnd()*6.28});
       spots.push({x,y:heightAt(x,z)+0.07,z,s:s*2.1,rx:-Math.PI/2});
     }
   }
-  // фонари вдоль дорог (не на перекрёстках)
+  /* Фонари вдоль дорог (не на перекрёстках). Консоль с плафоном выносится
+     над полотном: у столба вдоль Z она смотрит в −X, у столба вдоль X — в −Z. */
   for(const f of LINES){
     for(let t=-MAP+40; t<MAP; t+=90){
-      for(const [x,z] of [[f+ROAD_HALF+3.6,t],[t,f+ROAD_HALF+3.6]]){
+      for(const [x,z,ry] of [[f+ROAD_HALF+3.6,t,-Math.PI/2],[t,f+ROAD_HALF+3.6,Math.PI]]){
         if(Math.abs(x)>MAP||Math.abs(z)>MAP) continue;
         if(onPavement(x,z,ROAD_HALF+3)) continue;
         const y=heightAt(x,z);
-        poles.push({x,y:y+3.2,z,s:1});
-        heads.push({x,y:y+6.5,z,s:1});
-        lampHeads.push({x,y:y+6.5,z});
+        lamps.push({x,y,z,ry,s:1});
+        lampHeads.push({x:x+Math.sin(ry)*2.6,y:y+7.25,z:z+Math.cos(ry)*2.6});
         addCollider({x,z,r:.7});
       }
     }
@@ -1019,76 +1537,216 @@ const spotTex=radialTexture(0.95,0,2.2), haloTex=radialTexture(1,0,1.5);
     const x=vertical?fx:along, z=vertical?along:fx;
     if(onPavement(x,z,ROAD_HALF+2.8)) continue;
     const y=heightAt(x,z);
-    signPoles.push({x,y:y+1.3,z,s:1});
-    signPlates.push({x,y:y+2.7,z,s:1,ry:vertical?0:Math.PI/2});
+    signs.push({x,y,z,s:1,ry:vertical?0:Math.PI/2});
   }
 
-  const M = (c,e=0)=>new THREE.MeshLambertMaterial({color:c,flatShading:true,emissive:e});
-  // вертикальный градиент по вершинам: низ темнее — объём без лишних полигонов
-  function shaded(geo, dark){
-    geo.computeBoundingBox();
-    const bb=geo.boundingBox, pos=geo.attributes.position, col=[];
-    const c=new THREE.Color(), a=new THREE.Color(dark), b=new THREE.Color(0xFFFFFF);
-    for(let i=0;i<pos.count;i++){
-      const t=(pos.getY(i)-bb.min.y)/Math.max(bb.max.y-bb.min.y,0.001);
-      c.copy(a).lerp(b,t*t);
-      col.push(c.r,c.g,c.b);
+  /* ---------- модели ---------- */
+  const std=(o)=>new THREE.MeshStandardMaterial(Object.assign({roughness:.85,metalness:0},o));
+
+  // лиственное дерево: ствол с ветвями + крона из комков и карточек листвы
+  const barkMat=std({map:TEX.bark, normalMap:TEX.barkN, roughness:.95, color:0xB8A48C});
+  const trunkD=(()=>{
+    const t=new THREE.CylinderGeometry(.19,.32,5.2,8,3); t.translate(0,2.6,0);
+    const b1=new THREE.CylinderGeometry(.06,.12,2.4,6); b1.translate(0,1.2,0); b1.rotateZ(-.8); b1.translate(.1,3.6,0);
+    const b2=new THREE.CylinderGeometry(.05,.1,2.0,6);  b2.translate(0,1.0,0); b2.rotateZ(.9);  b2.rotateY(2.1); b2.translate(0,3.9,.05);
+    return mergeGeos([t,b1,b2]);
+  })();
+  const CROWN_C=[0,5.4,0];
+  const aoFol=(cy,span)=>(x,y,z)=>{ const k=.42+.58*clamp((y-cy+span*.6)/(span*1.2),0,1); return [k,k,k]; };
+  const crownBlob=(()=>{
+    const parts=[[0,5.3,0,2.1],[.95,6.0,.4,1.55],[-.85,5.8,-.55,1.6],[.2,4.5,-.9,1.35],[-.3,6.6,.3,1.2]]
+      .map(([x,y,z,r],i)=>{ const g=lumpy(new THREE.IcosahedronGeometry(r,2),r*.16,31+i); g.translate(x,y,z); return g; });
+    const g=mergeGeos(parts); g.computeVertexNormals();
+    sphereNormals(g,...CROWN_C,.9,.75);
+    return vcol(g, aoFol(5.4,3.2));
+  })();
+  const cards=(cx,cy,cz,R,n,size,seed,sy=.85)=>{
+    const r=mulberry32(seed), parts=[];
+    for(let i=0;i<n;i++){
+      const p=new THREE.PlaneGeometry(size,size), th=r()*6.283, ph=Math.acos(r()*1.6-.8), rr=R*(.75+r()*.35);
+      p.rotateX(r()*6.283); p.rotateY(r()*6.283); p.rotateZ(r()*6.283);
+      p.translate(cx+Math.sin(ph)*Math.cos(th)*rr, cy+Math.cos(ph)*rr*sy, cz+Math.sin(ph)*Math.sin(th)*rr);
+      parts.push(p);
     }
-    geo.setAttribute('color', new THREE.Float32BufferAttribute(col,3));
-    return geo;
-  }
-  const Mv=(c)=>new THREE.MeshLambertMaterial({color:c,flatShading:true,vertexColors:true});
+    const g=mergeGeos(parts); sphereNormals(g,cx,cy,cz,sy,1);
+    return g;
+  };
+  const crownCards=vcol(cards(...CROWN_C,2.2,34,1.9,301), aoFol(5.4,3.2));
+  const leafMat=std({map:TEX.leaf, alphaTest:.5, side:THREE.DoubleSide, vertexColors:true, roughness:.75});
+  leafMat.userData.nbOpt={key:'leaf', frag:KEEP_NORMAL};
+  const blobMat=std({map:TEX.leafSolid, vertexColors:true, roughness:.85});
 
-  instanced(new THREE.CylinderGeometry(.5,.65,1,5), M(0x5A4327), trunks);
-  instanced(shaded(new THREE.IcosahedronGeometry(1,0),0x2E5626), Mv(0x4B8A3C), crowns);
-  instanced(new THREE.DodecahedronGeometry(1,0),     M(0x8C8A85), rocks);
-  instanced(new THREE.BoxGeometry(6,4.4,7),          M(0xC7B49A), walls);
-  instanced(new THREE.ConeGeometry(5.2,2.6,4),       M(0x8E4A3C), roofs);
-  /* Окна и двери — накладки постоянного размера: они не должны расти вместе
-     с домом, иначе у большой избы получается витрина. Тени выключены, как у
-     знаков и плафонов: пластины лежат заподлицо, силуэт даёт сама стена. */
-  winMat = M(0x2A3A4A,0x000000);
-  const winGeo=new THREE.BoxGeometry(.9,.9,.12);     // одна на зажжённые и на тёмные
-  instanced(winGeo,                                  winMat,        winLit,  false);
-  instanced(winGeo,                                  M(0x1E2A36),   winDark, false);
-  instanced(new THREE.BoxGeometry(1.1,2.1,.12),      M(0x5A3B27),   doors,   false);
-  const bushMesh=instanced(shaded(new THREE.IcosahedronGeometry(1,0),0x2A4520), Mv(0x3E6B34), bushes);
+  // ель: тонкий ствол и ярусы рваных конусов
+  const trunkC=(()=>{ const t=new THREE.CylinderGeometry(.08,.3,9.6,7); t.translate(0,4.8,0); return t; })();
+  const conifer=(()=>{
+    const parts=[];
+    for(let k=0;k<6;k++){
+      const y0=1.5+k*1.3, R=2.5*(1-k/6.6)+.35, h=2.5;
+      const c=new THREE.ConeGeometry(R,h,12,2); c.translate(0,y0+h/2,0);
+      const p=c.attributes.position;
+      for(let i=0;i<p.count;i++){
+        const x=p.getX(i), z=p.getZ(i), y=p.getY(i), rad=Math.hypot(x,z);
+        if(rad<1e-3) continue;
+        const a=Math.atan2(z,x), j=1+.2*Math.sin(a*7+k*1.7)+.1*Math.sin(a*13+k), rim=rad/R;
+        p.setXYZ(i, x*j, y-rim*rim*.35, z*j);
+      }
+      parts.push(c);
+    }
+    const g=mergeGeos(parts); g.computeVertexNormals();
+    sphereNormals(g,0,5,0,2.2,.55);
+    return vcol(g,(x,y,z)=>{ const k=.45+.55*clamp(Math.hypot(x,z)/2.2,0,1)*(.6+.4*clamp(y/9,0,1)); return [k,k,k]; });
+  })();
+  const coniferMat=std({map:TEX.leafSolid, vertexColors:true, roughness:.9, color:0x9FB39A});
+
+  const decid=[], conif=[], decCol=[], conCol=[];
+  for(const t of trees){
+    const h=hashXZ(t.x,t.z), c=new THREE.Color();
+    if(h<.34){ conif.push(t); c.setHSL(.3+hashXZ(t.x,t.z,1)*.05,.35,.52+hashXZ(t.x,t.z,2)*.12); conCol.push(c); }
+    else {
+      decid.push(t);
+      const au=hashXZ(t.x,t.z,3);                         // редкое дерево уже желтеет
+      if(au>.93) c.setHSL(.12+au*.02,.55,.62); else c.setHSL(.22+hashXZ(t.x,t.z,1)*.07,.38,.62+hashXZ(t.x,t.z,2)*.12);
+      decCol.push(c);
+    }
+  }
+  chunked(trunkD, barkMat, decid);
+  chunked(crownBlob, blobMat, decid, {colors:decCol});
+  chunked(crownCards, leafMat, decid, {colors:decCol});
+  chunked(trunkC, barkMat, conif);
+  chunked(conifer, coniferMat, conif, {colors:conCol});
+
+  // камни: комковатая глыба, приплюснутая, с гладкими нормалями
+  // гранёная глыба: крупные сколы остаются рёбрами, мелкие неровности сглажены
+  const rockGeo=(()=>{ const g=lumpy(new THREE.IcosahedronGeometry(1,2),.3,7); g.scale(1.2,.7,1); return creaseNormals(g,.5); })();
+  chunked(rockGeo, std({map:TEX.rock, normalMap:TEX.rockN, normalScale:new THREE.Vector2(.6,.6), roughness:.88}), rocks,
+    {colors:rocks.map(o=>new THREE.Color().setHSL(.08+hashXZ(o.x,o.z)*.05,.1,.72+hashXZ(o.x,o.z,1)*.18))});
+
+  /* Дома. Всё собирается из одного списка стен: цоколь, стены, фронтоны,
+     двускатная крыша из профнастила и труба у части домов. Цвета — хешем
+     по индексу, как в деревне: беленые, голубые, жёлтые, бревенчатые. */
+  const WALLC=[0xEDE6D6,0xDCCDA6,0xB7CFDC,0xC8D6B6,0xE6D38E,0xA07C5A,0xF2F0EA,0xCFA98A];
+  const ROOFC=[0x9A4232,0x6A767A,0x44664D,0x4C6284,0x80807A,0x7A3A2E];
+  const wallCol=walls.map((o,i)=>new THREE.Color(WALLC[Math.floor(hash01(i,17)*WALLC.length)]));
+  const roofCol=walls.map((o,i)=>new THREE.Color(ROOFC[Math.floor(hash01(i,29)*ROOFC.length)]));
+  const sidingMat=std({map:TEX.siding, normalMap:TEX.sidingN, roughness:.9});
+  chunked(scaleUV(new THREE.BoxGeometry(6,4.4,7),2,1), sidingMat, walls, {colors:wallCol});
+  chunked((()=>{ const g=new THREE.BoxGeometry(6.18,.9,7.18); g.translate(0,-2.2+.35,0); return scaleUV(g,3,.4); })(),
+    std({map:TEX.concrete, roughness:.95, color:0x9A9894}), walls);
+  // фронтоны — треугольные призмы под скатами, того же цвета, что стены
+  chunked((()=>{ const sh=new THREE.Shape([new THREE.Vector2(-3,0),new THREE.Vector2(3,0),new THREE.Vector2(0,2.3)]);
+    const g=new THREE.ExtrudeGeometry(sh,{depth:7,bevelEnabled:false}); g.translate(0,2.2,-3.5); return scaleUV(g,1/3,1/4.4); })(),
+    sidingMat, walls, {colors:wallCol});
+  // скаты: две плиты с выносом за стены
+  const roofGeo=(()=>{
+    const a=Math.atan2(2.3,3), L=3.5/Math.cos(a)+.08, parts=[];
+    for(const sgn of [1,-1]){
+      const g=new THREE.BoxGeometry(L,.14,7.9);
+      scaleUV(g,1,1.6);
+      g.translate(-sgn*L/2,.07,0); g.rotateZ(sgn*a);
+      g.translate(0,2.2+2.3+.02,0);
+      parts.push(g);
+    }
+    return mergeGeos(parts);
+  })();
+  chunked(roofGeo, std({map:TEX.roof, normalMap:TEX.roofN, roughness:.55, metalness:.35}), walls, {colors:roofCol});
+  chunked((()=>{ const g=new THREE.BoxGeometry(.6,2.2,.6); g.translate(1.3,2.2+2.2,1.6); return g; })(),
+    std({color:0x8E4A38, roughness:.9}), walls.filter((o,i)=>hash01(i,43)<.6));
+  /* Окна: рама из четырёх планок и подоконника, за ней стекло. Стекло гладкое —
+     днём в нём отражается небо, ночью у части окон горит тёплый свет. */
+  const frameGeo=(()=>{ const b=(w,h,x,y)=>{ const g=new THREE.BoxGeometry(w,h,.12); g.translate(x,y,0); return g; };
+    return mergeGeos([b(1.04,.1,0,.47),b(1.04,.1,0,-.47),b(.1,.84,-.47,0),b(.1,.84,.47,0),b(.08,.84,0,0),
+      (()=>{ const g=new THREE.BoxGeometry(1.2,.07,.26); g.translate(0,-.54,.07); return g; })()]); })();
+  instanced(frameGeo, std({color:0xE8E6E0, roughness:.6}), winLit.concat(winDark), false);
+  const glassGeo=new THREE.PlaneGeometry(.86,.86);
+  winMat = std({color:0x1A232C, roughness:.06, metalness:0, emissive:0x000000});
+  instanced(glassGeo, winMat, winLit, false);
+  instanced(glassGeo, std({color:0x141B22, roughness:.06, metalness:0}), winDark, false);
+  instanced(new THREE.BoxGeometry(1.1,2.1,.12), std({map:TEX.wood, roughness:.8}), doors, false);
+
+  // кусты: комок с карточками листвы, цвета по-прежнему из rnd() — поток ГПСЧ
+  // тратится на них ровно так же, как раньше
+  const bushCol=[];
   {
     const bc=new THREE.Color();
     for(let i=0;i<bushes.length;i++){
       bc.setHSL(0.26+rnd()*0.06, 0.34+rnd()*0.16, 0.20+rnd()*0.12);
-      bushMesh.setColorAt(i,bc);
+      const hsl={}; bc.getHSL(hsl);
+      bushCol.push(new THREE.Color().setHSL(hsl.h, hsl.s*.8, .5+hsl.l*.5));
     }
-    if(bushMesh.instanceColor) bushMesh.instanceColor.needsUpdate=true;
   }
-  instanced(new THREE.CylinderGeometry(.16,.2,6.4,6),M(0x4A5158), poles);
-  lampMat = M(0xFFE9B0,0x000000);
-  instanced(new THREE.BoxGeometry(1.2,.35,.6),       lampMat, heads, false);
-  instanced(new THREE.CylinderGeometry(.09,.09,2.6,5),M(0x9AA0A6), signPoles,false);
-  instanced(new THREE.BoxGeometry(1.5,1.5,.1),       M(0xE2E6E9), signPlates,false);
+  const bushBlob=vcol(sphereNormals(smoothNormals(lumpy(new THREE.IcosahedronGeometry(1,2),.16,91)),0,0,0,1,.6),
+    (x,y,z)=>{ const k=.45+.55*clamp((y+.8)/1.6,0,1); return [k,k,k]; });
+  const bushCards=vcol(cards(0,0,0,.95,14,1.05,92,.8),(x,y,z)=>{ const k=.5+.5*clamp((y+.8)/1.6,0,1); return [k,k,k]; });
+  chunked(bushBlob, blobMat, bushes, {colors:bushCol});
+  chunked(bushCards, leafMat, bushes, {colors:bushCol});
+
+  // фонари: оцинкованный столб, консоль над дорогой, плафон «кобра»
+  const metal=std({color:0x9AA0A4, roughness:.45, metalness:.8});
+  const lampGeo=(()=>{
+    const pole=new THREE.CylinderGeometry(.09,.15,7.4,10); pole.translate(0,3.7,0);
+    const arm=new THREE.CylinderGeometry(.05,.06,2.7,6); arm.rotateX(Math.PI/2); arm.rotateX(-.12); arm.translate(0,7.25,1.3);
+    const head=new THREE.BoxGeometry(.42,.18,.95); head.translate(0,7.28,2.55);
+    const base=new THREE.CylinderGeometry(.22,.26,.5,10); base.translate(0,.25,0);
+    return mergeGeos([pole,arm,head,base]);
+  })();
+  chunked(lampGeo, metal, lamps);
+  lampMat = std({color:0xFFF3D6, roughness:.3, emissive:0x000000});
+  chunked((()=>{ const g=new THREE.BoxGeometry(.34,.04,.8); g.translate(0,7.17,2.55); return g; })(), lampMat, lamps, {cast:false});
+
+  /* Знаки: четыре вида, вид выбирается хешем. Лицевая пластина с рисунком,
+     тыльная — тёмный металл того же силуэта (альфа-тест по той же текстуре). */
+  const signTexs=[
+    (g)=>{ g.fillStyle='#fff'; g.beginPath(); g.arc(64,64,60,0,6.283); g.fill();
+           g.lineWidth=13; g.strokeStyle='#D8231B'; g.beginPath(); g.arc(64,64,52,0,6.283); g.stroke();
+           g.fillStyle='#111'; g.font='bold 52px Arial'; g.textAlign='center'; g.textBaseline='middle'; g.fillText('60',64,67); },
+    (g)=>{ const tri=(r,c)=>{ g.fillStyle=c; g.beginPath(); g.moveTo(64,64-r); g.lineTo(64+r*.93,64+r*.62); g.lineTo(64-r*.93,64+r*.62); g.closePath(); g.fill(); };
+           tri(66,'#D8231B'); tri(46,'#fff'); g.fillStyle='#111'; g.fillRect(60,48,8,32); g.fillRect(60,86,8,8); },
+    (g)=>{ const tri=(r,c)=>{ g.fillStyle=c; g.beginPath(); g.moveTo(64,64+r); g.lineTo(64+r*.93,64-r*.62); g.lineTo(64-r*.93,64-r*.62); g.closePath(); g.fill(); };
+           tri(66,'#D8231B'); tri(44,'#fff'); },
+    (g)=>{ g.fillStyle='#fff'; g.fillRect(6,6,116,116); g.fillStyle='#1F57B8'; g.fillRect(12,12,104,104);
+           g.fillStyle='#fff'; g.font='bold 30px Arial'; g.textAlign='center'; g.textBaseline='middle'; g.fillText('АЗС',64,48);
+           g.font='bold 22px Arial'; g.fillText('5 км',64,86); }
+  ].map(fn=>{ const t=canvasTex(128,128,null,{post:fn}); t.wrapS=t.wrapT=THREE.ClampToEdgeWrapping; return t; });
+  const signPole=(()=>{ const g=new THREE.CylinderGeometry(.045,.05,2.9,8); g.translate(0,1.45,-.05); return g; })();
+  instanced(signPole, metal, signs, true);
+  const face=new THREE.PlaneGeometry(1.2,1.2); face.translate(0,2.55,.0);
+  const back=new THREE.PlaneGeometry(1.2,1.2); back.rotateY(Math.PI); back.translate(0,2.55,-.02);
+  signTexs.forEach((tex,k)=>{
+    const list=signs.filter(o=>Math.floor(hashXZ(o.x,o.z)*4)===k);
+    instanced(face, std({map:tex, alphaTest:.5, roughness:.4}), list, true);
+    instanced(back, std({map:tex, alphaTest:.5, roughness:.5, color:0x3A3E42, metalness:.6}), list, false);
+  });
 }
 
-/* --- контактные тени под объектами (одна отрисовка на всё) --- */
-instanced(new THREE.PlaneGeometry(1,1),
-  // заодно контактные пятна: это тоже тени, и оставь их прежними — под деревьями
-  // и домами остались бы чёрные блины при осветлённой падающей тени
-  new THREE.MeshBasicMaterial({map:spotTex,color:0x0C1409,transparent:true,opacity:.21,
+/* --- контактные тени под объектами --- */
+chunked(new THREE.PlaneGeometry(1,1),
+  // пятна дают «запечённую» затенённость у подошвы: падающая тень есть только
+  // рядом с машиной, а пятна работают по всей карте
+  new THREE.MeshBasicMaterial({map:spotTex,color:0x0C1409,transparent:true,opacity:.3,
     depthWrite:false,polygonOffset:true,polygonOffsetFactor:-3,polygonOffsetUnits:-3}),
-  spots, false);
+  spots, {cast:false, receive:false});
 
 /* --- ореолы фонарей: одна точечная система, всегда лицом к камере --- */
 const lampGlow = (()=>{
   const g=new THREE.BufferGeometry(), p=new Float32Array(lampHeads.length*3);
-  lampHeads.forEach((l,i)=>{ p[i*3]=l.x; p[i*3+1]=l.y; p[i*3+2]=l.z; });
+  lampHeads.forEach((l,i)=>{ p[i*3]=l.x; p[i*3+1]=l.y-.2; p[i*3+2]=l.z; });
   g.setAttribute('position', new THREE.BufferAttribute(p,3));
-  const m=new THREE.Points(g, new THREE.PointsMaterial({map:haloTex,color:0xFFD9A0,size:11,
+  const mat=new THREE.PointsMaterial({map:haloTex,color:0xFFD9A0,size:7,
     sizeAttenuation:true,transparent:true,opacity:0,depthWrite:false,
-    blending:THREE.AdditiveBlending,fog:true}));
+    blending:THREE.AdditiveBlending,fog:true});
+  mat.userData.nbOpt={key:'glowpts', additive:true};
+  const m=new THREE.Points(g, mat);
   scene.add(m); return m;
 })();
-// круглая текстура готова — отдаём её светилам
-sunDisc.material.map=haloTex;  sunDisc.material.needsUpdate=true;
-moonDisc.material.map=haloTex; moonDisc.material.needsUpdate=true;
+/* --- пятна света под фонарями: ночью на асфальте лежат тёплые круги --- */
+const lampPools = (()=>{
+  const mat=new THREE.MeshBasicMaterial({map:haloTex,color:0xFFC98A,transparent:true,opacity:0,
+    depthWrite:false,blending:THREE.AdditiveBlending,polygonOffset:true,polygonOffsetFactor:-4,polygonOffsetUnits:-4});
+  mat.userData.nbOpt={key:'pool', additive:true};
+  const list=lampHeads.map(l=>({x:l.x,y:heightAt(l.x,l.z)+.3,z:l.z,s:17,rx:-Math.PI/2}));
+  const m=instanced(new THREE.PlaneGeometry(1,1), mat, list, false);
+  m.renderOrder=1; return m;
+})();
 
 /* --- препятствия (появляются с ростом сложности; на полотно не ставятся) --- */
 const BARRIER_MAX = 130;
@@ -1110,68 +1768,128 @@ for(let i=0;i<BARRIER_MAX;i++){
   barrierList.push({x,y:heightAt(x,z)+.6,z,ry});
   addCollider({x,z,r:1.9,idx:barrierList.length-1});
 }
-const barriers = instanced(new THREE.BoxGeometry(3.4,1.2,.5),
-  new THREE.MeshLambertMaterial({color:0xD94A32,flatShading:true}), barrierList);
+/* Бетонный блок «нью-джерси»: широкое основание и узкий верх, красно-белые
+   полосы. Габарит прежний — 3.4 в длину, 1.2 в высоту. */
+const barriers = (()=>{
+  const tex=canvasTex(256,64,d=>{
+    for(let y=0;y<64;y++) for(let x=0;x<256;x++){
+      const red=Math.floor(x/32)%2===0, n=NA(x/256*32,y/64*8,32,8)*.12, dirt=smooth(40,64,y)*.25;
+      const l=1-dirt-n;
+      put(d,(y*256+x)*4, red?.78*l:.9*l, red?.12*l:.9*l, red?.1*l:.88*l);
+    }
+  });
+  const b1=new THREE.BoxGeometry(3.4,.4,.62); b1.translate(0,-.4,0);
+  const b2=new THREE.BoxGeometry(3.4,.3,.46); b2.translate(0,-.05,0);
+  const b3=new THREE.BoxGeometry(3.4,.5,.26); b3.translate(0,.35,0);
+  return instanced(mergeGeos([b1,b2,b3]),
+    new THREE.MeshStandardMaterial({map:tex, roughness:.85}), barrierList);
+})();
 barriers.count = 0;
 
 /* ============================================================
    5. АВТОМОБИЛЬ
    ============================================================ */
-/* Геометрии, общие у машины игрока и у встречного трафика: раньше каждая
-   создавалась дважды одними и теми же числами. Форма от этого не меняется —
-   экономятся только буферы в памяти и в драйвере. */
-const WHEEL_GEO=new THREE.CylinderGeometry(.45,.45,.34,10); WHEEL_GEO.rotateZ(Math.PI/2);
-const HEAD_GEO =new THREE.BoxGeometry(.42,.2,.12);          // фара
-const TAIL_GEO =new THREE.BoxGeometry(.5,.08,.1);           // стоп-сигнал
+/* Геометрии общие у машины игрока и у встречного трафика: кузов выдавлен
+   из бокового профиля с арками колёс и скруглён фаской, салон — стеклянный
+   «аквариум», поверх которого лежат крыша и стойки в цвет кузова. */
+const WHEEL_R=.37;
+const HEAD_GEO =new THREE.BoxGeometry(.44,.17,.1);          // фара
+const TAIL_GEO =new THREE.BoxGeometry(.46,.14,.08);         // стоп-сигнал
+const HEAD_POS=[[-.62,.72,2.24],[.62,.72,2.24]], TAIL_POS=[[-.64,.86,-2.27],[.64,.86,-2.27]];
+const WHEEL_POS=[[-.8,-1.4],[.8,-1.4],[-.8,1.4],[.8,1.4]];
+const CAR=(()=>{
+  // профиль в плоскости (z вдоль машины, y вверх) → выдавливание по ширине
+  const extrude=(shape,width,bevel)=>{
+    const g=new THREE.ExtrudeGeometry(shape,{depth:width-bevel*2,bevelEnabled:true,bevelThickness:bevel,
+      bevelSize:bevel,bevelSegments:3,curveSegments:12});
+    g.rotateY(-Math.PI/2); g.translate((width-bevel*2)/2,0,0);
+    return creaseNormals(g,.7);
+  };
+  const b=new THREE.Shape();
+  b.moveTo(-2.16,.34);
+  b.lineTo(-1.86,.34); b.absarc(-1.4,.37,.46,Math.PI,0,true);
+  b.lineTo(.94,.34);   b.absarc(1.4,.37,.46,Math.PI,0,true);
+  b.lineTo(2.16,.34); b.lineTo(2.24,.52); b.lineTo(2.2,.8); b.lineTo(1.85,.92);
+  b.lineTo(.62,1.0); b.lineTo(-1.62,1.02); b.lineTo(-2.12,.98); b.lineTo(-2.22,.6);
+  b.closePath();
+  const body=extrude(b,1.84,.07);
+  const c=new THREE.Shape();
+  c.moveTo(.64,.98); c.lineTo(-.04,1.45); c.lineTo(-1.1,1.47); c.lineTo(-1.68,.99); c.closePath();
+  const glass=extrude(c,1.62,.05);
+  // стойка по ребру между двумя точками профиля
+  const edge=(z1,y1,z2,y2,x,tx,ty)=>{
+    const g=new THREE.BoxGeometry(tx,ty,Math.hypot(z2-z1,y2-y1));
+    g.rotateX(-Math.atan2(y2-y1,z2-z1)); g.translate(x,(y1+y2)/2,(z1+z2)/2); return g;
+  };
+  const paintParts=[body, (()=>{ const g=new THREE.BoxGeometry(1.64,.07,1.2); g.translate(0,1.515,-.57); return g; })()];
+  for(const x of [-.8,.8]){
+    paintParts.push(edge(.64,.98,-.04,1.47,x,.08,.1), edge(-.52,1.0,-.52,1.48,x,.08,.14),
+                    edge(-1.1,1.48,-1.68,.99,x,.08,.26));
+  }
+  const box=(w,h,d,x,y,z)=>{ const g=new THREE.BoxGeometry(w,h,d); g.translate(x,y,z); return g; };
+  const trim=mergeGeos([box(1.94,.2,.2,0,.44,2.26), box(1.94,.2,.2,0,.44,-2.26), box(1.0,.15,.05,0,.64,2.25),
+    box(1.6,.12,3.8,0,.3,0), box(.2,.12,.1,-.98,1.08,.52), box(.2,.12,.1,.98,1.08,.52),
+    box(.52,.12,.02,0,.44,2.37), box(.52,.12,.02,0,.44,-2.37),
+    // швы дверей и ручки на обоих бортах
+    ...[-1,1].flatMap(sx=>[box(.012,.56,.012,sx*.925,.7,.6), box(.012,.56,.012,sx*.925,.7,-.55),
+      box(.012,.5,.012,sx*.925,.72,-1.6), box(.03,.04,.17,sx*.93,.88,.28), box(.03,.04,.17,sx*.93,.88,-.85)])]);
+  // колесо: шина вращением профиля, диск со спицами; ось — X
+  const tire=new THREE.LatheGeometry([[.25,-.125],[.33,-.13],[.36,-.115],[.37,-.06],[.37,.06],[.36,.115],[.33,.13],[.25,.125]]
+    .map(([r,y])=>new THREE.Vector2(r,y)),22);
+  tire.rotateZ(Math.PI/2);
+  const rimParts=[(()=>{ const g=new THREE.CylinderGeometry(.25,.25,.2,18); g.rotateZ(Math.PI/2); return g; })()];
+  for(const sx of [-.105,.105]) for(let k=0;k<5;k++){
+    const g=new THREE.BoxGeometry(.03,.4,.07); g.rotateX(k*1.2566); g.translate(sx,0,0); rimParts.push(g);
+  }
+  return {paint:mergeGeos(paintParts), glass, trim, tire, rim:mergeGeos(rimParts)};
+})();
+const MAT={
+  glass:new THREE.MeshStandardMaterial({color:0x0C1218, roughness:.04, metalness:0, envMapIntensity:1.6}),
+  trim: new THREE.MeshStandardMaterial({color:0x17191B, roughness:.6}),
+  tire: new THREE.MeshStandardMaterial({color:0x151515, roughness:.92}),
+  rim:  new THREE.MeshStandardMaterial({color:0xB9BDC2, roughness:.28, metalness:.9}),
+  head: new THREE.MeshStandardMaterial({color:0xDCE4EC, roughness:.08, metalness:.6, emissive:0xFFF0D0, emissiveIntensity:0}),
+  tail: new THREE.MeshStandardMaterial({color:0x5E0B08, roughness:.25, emissive:0xFF0703, emissiveIntensity:0}),
+  shadow:new THREE.MeshBasicMaterial({map:spotTex, color:0x000000, transparent:true, opacity:.55,
+    depthWrite:false, polygonOffset:true, polygonOffsetFactor:-4, polygonOffsetUnits:-4})
+};
+// мягкая тень-пятно под днищем: падающая тень сверху её не заменяет
+const SHADOW_GEO=(()=>{ const g=new THREE.PlaneGeometry(2.7,5.3); g.rotateX(-Math.PI/2); g.translate(0,.05,0); return g; })();
 
 const car = new THREE.Group(); car.rotation.order='YXZ'; scene.add(car);
 const wheels=[], headGlow=[];
 {
-  /* Кузов и стекло — Phong, всё остальное в игре остаётся Lambert.
-     Ламберт не умеет отражать солнце вовсе, из-за чего машина днём выглядела
-     крашеным картоном. Грани у кузова плоские, нормаль по грани постоянна,
-     но вектор до камеры внутри грани меняется — блик получается градиентом,
-     а не ровной заливкой, и ползёт по борту на поворотах.
-     Только эти два материала: Phong на всю сцену — уже разговор про кадры. */
-  const paint=new THREE.MeshPhongMaterial({color:0xE0A423,flatShading:true,
-    shininess:34,specular:0x554F42});
-  const dark =new THREE.MeshLambertMaterial({color:0x23272C,flatShading:true});
-  const glass=new THREE.MeshPhongMaterial({color:0x2E4756,flatShading:true,
-    shininess:95,specular:0x8A99A8});
+  // автоэмаль: металлик под прозрачным лаком — блик лака отдельный и острый
+  const paint=new THREE.MeshPhysicalMaterial({color:0xE0A423, metalness:.45, roughness:.34,
+    clearcoat:1, clearcoatRoughness:.05});
+  [[CAR.paint,paint],[CAR.glass,MAT.glass],[CAR.trim,MAT.trim]].forEach(([g,m])=>{
+    const mesh=new THREE.Mesh(g,m); mesh.castShadow=true; mesh.receiveShadow=true; car.add(mesh);
+  });
+  car.add(new THREE.Mesh(SHADOW_GEO, MAT.shadow));
 
-  const body=new THREE.Mesh(new THREE.BoxGeometry(2.0,.7,4.3),paint); body.position.y=.85;
-  const cab =new THREE.Mesh(new THREE.BoxGeometry(1.72,.62,2.0),glass); cab.position.set(0,1.42,-.15);
-  const nose=new THREE.Mesh(new THREE.BoxGeometry(1.9,.34,.9),paint); nose.position.set(0,.68,2.1);
-  [body,cab,nose].forEach(m=>{m.castShadow=true;car.add(m);});
-
-  [[-.95,-1.45],[.95,-1.45],[-.95,1.45],[.95,1.45]].forEach(([x,z],i)=>{
-    const w=new THREE.Mesh(WHEEL_GEO,dark); w.position.set(x,.48,z); w.rotation.order='YXZ';
-    w.castShadow=true; w.userData.front = i>1; car.add(w); wheels.push(w);
+  WHEEL_POS.forEach(([x,z],i)=>{
+    const w=new THREE.Group(); w.position.set(x,WHEEL_R,z); w.rotation.order='YXZ';
+    [[CAR.tire,MAT.tire],[CAR.rim,MAT.rim]].forEach(([g,m])=>{ const mm=new THREE.Mesh(g,m); mm.castShadow=true; w.add(mm); });
+    w.userData.front = i>1; car.add(w); wheels.push(w);
   });
 
-  // фары и стопы
-  const hl=new THREE.MeshBasicMaterial({color:0xFFF0C0});
-  const tl=new THREE.MeshBasicMaterial({color:0x8E1B12});
-  [[-.62,2.5],[.62,2.5]].forEach(([x,z])=>{
-    const m=new THREE.Mesh(HEAD_GEO,hl); m.position.set(x,.8,z); car.add(m);
-  });
-  // стопы: две узкие полосы по краям кормы, а не одна сплошная через весь борт
-  [-.62,.62].forEach(x=>{
-    const m=new THREE.Mesh(TAIL_GEO,tl); m.position.set(x,.95,-2.2); car.add(m);
-  });
-  car.userData.tailMat=tl;   // цвет стопов правится в цикле кадра через материал
+  // фары и стопы — свои материалы: у игрока стопы загораются при торможении
+  const hl=MAT.head.clone(), tl=MAT.tail.clone();
+  HEAD_POS.forEach(([x,y,z])=>{ const m=new THREE.Mesh(HEAD_GEO,hl); m.position.set(x,y,z); car.add(m); });
+  TAIL_POS.forEach(([x,y,z])=>{ const m=new THREE.Mesh(TAIL_GEO,tl); m.position.set(x,y,z); car.add(m); });
+  car.userData.tailMat=tl; car.userData.headMat=hl;
 
-  // ореолы фар — дают bloom-эффект без постобработки
-  [-.62,.62].forEach(x=>{
+  // ореолы фар — видны и без постобработки
+  HEAD_POS.forEach(([x,y,z])=>{
     const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:haloTex,color:0xFFE6B4,
       transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,opacity:0,fog:true}));
-    sp.scale.set(5,5,1); sp.position.set(x,.82,2.55); car.add(sp); headGlow.push(sp);
+    sp.scale.set(4,4,1); sp.position.set(x,y,z+.12); car.add(sp); headGlow.push(sp);
   });
 
   // ближний свет (включается ночью)
   const beam=(x)=>{
-    const l=new THREE.SpotLight(0xFFE9C0, 0, 95, 0.44, .45, 1.1);
-    l.position.set(x,.85,2.4); l.target.position.set(x,-1.2,30);
+    const l=new THREE.SpotLight(0xFFE9C0, 0, 95, 0.4, .6, 1.1);
+    l.position.set(x,.8,2.4); l.target.position.set(x,-.6,30);
     car.add(l); car.add(l.target); return l;
   };
   car.userData.beams=[beam(-.62),beam(.62)];
@@ -1186,17 +1904,40 @@ const stationGlow = new THREE.Sprite(new THREE.SpriteMaterial({map:haloTex,color
   transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,opacity:.5,fog:true}));
 stationGlow.scale.set(30,30,1); stationGlow.position.y=19.4; station.add(stationGlow);
 {
-  const steel=new THREE.MeshLambertMaterial({color:0xD8DDE2,flatShading:true});
-  const red  =new THREE.MeshLambertMaterial({color:0xE0392B,flatShading:true,emissive:0x360a06});
-  const glow =new THREE.MeshBasicMaterial({color:0x7CFFC4});
+  const std=(o)=>new THREE.MeshStandardMaterial(Object.assign({roughness:.5,metalness:0},o));
+  const white=std({color:0xF0F0EC, roughness:.45}), green=std({color:0x17805A, roughness:.4});
+  const conc=std({map:TEX.concrete, roughness:.92});
+  const add=(g,m,x,y,z,cast=true)=>{ const o=new THREE.Mesh(g,m); o.position.set(x,y,z);
+    o.castShadow=cast; o.receiveShadow=true; station.add(o); return o; };
 
-  const canopy=new THREE.Mesh(new THREE.BoxGeometry(14,.7,10),steel); canopy.position.y=6.2; canopy.castShadow=true;
-  station.add(canopy);
-  [[-6,-4],[6,-4],[-6,4],[6,4]].forEach(([x,z])=>{
-    const p=new THREE.Mesh(new THREE.CylinderGeometry(.35,.35,6,6),steel);
-    p.position.set(x,3,z); p.castShadow=true; station.add(p);
-  });
-  const pump=new THREE.Mesh(new THREE.BoxGeometry(1.2,2.2,2.6),red); pump.position.y=1.1; pump.castShadow=true; station.add(pump);
+  // бетонная площадка: толстая плита, чтобы на склоне уходила в грунт, а не висела
+  add(scaleUV(new THREE.BoxGeometry(24,1.2,18),3,2.2), conc, 0,-.45,0, false);
+  // навес: белый короб, зелёная полоса, под ним светильники
+  add(new THREE.BoxGeometry(14,.9,10), white, 0,6.2,0);
+  add(new THREE.BoxGeometry(14.08,.3,10.08), green, 0,6.0,0);
+  const panelMat=new THREE.MeshStandardMaterial({color:0xFFFFFF, emissive:0xFFF4E2, emissiveIntensity:1.2});
+  for(const x of [-4,0,4]) for(const z of [-2.5,2.5]){
+    const p=new THREE.Mesh(new THREE.PlaneGeometry(1.8,.6), panelMat); p.rotation.x=Math.PI/2;
+    p.position.set(x,5.74,z); station.add(p);
+  }
+  station.userData.panelMat=panelMat;
+  [[-6,-4],[6,-4],[-6,4],[6,4]].forEach(([x,z])=>add(new THREE.BoxGeometry(.5,5.8,.5), white, x,2.9,z));
+
+  // островок с двумя колонками: красный корпус, белая шапка, светящееся табло
+  add(new THREE.BoxGeometry(1.6,.25,5.4), conc, 0,.12,0, false);
+  const red=std({color:0xC8231B, roughness:.35});
+  const screen=new THREE.MeshStandardMaterial({color:0x0A1A12, emissive:0x7CFFC4, emissiveIntensity:.8});
+  const hose=std({color:0x151515, roughness:.7});
+  for(const z of [-1.5,1.5]){
+    add(new THREE.BoxGeometry(.9,1.7,.7), red, 0,1.1,z);
+    add(new THREE.BoxGeometry(.96,.36,.76), white, 0,2.13,z);
+    for(const sx of [-1,1]){
+      const s=new THREE.Mesh(new THREE.PlaneGeometry(.5,.26), screen);
+      s.position.set(sx*.46,1.6,z); s.rotation.y=sx*Math.PI/2; station.add(s);
+      add(new THREE.BoxGeometry(.08,.34,.14), hose, sx*.5,1.05,z+.12);
+    }
+  }
+  station.userData.screenMat=screen;
 
   /* Вывеска прямо на козырьке — отдельная мачта у обочины только загораживала
      подъезд и дублировала маркер-луч, который и так виден сквозь туман. */
@@ -1217,16 +1958,16 @@ stationGlow.scale.set(30,30,1); stationGlow.position.y=19.4; station.add(station
     const t=new THREE.CanvasTexture(c); t.colorSpace=THREE.SRGBColorSpace; return t;
   })();
   const signMat=new THREE.MeshBasicMaterial({map:signTex});
+  station.userData.signMat=signMat;
   [1,-1].forEach(s=>{
-    const frame=new THREE.Mesh(new THREE.BoxGeometry(8.4,2.9,.4),
-      new THREE.MeshLambertMaterial({color:0x143A2C,flatShading:true}));
-    frame.position.set(0,8.0,4.4*s); frame.castShadow=true; station.add(frame);
+    add(new THREE.BoxGeometry(8.4,2.9,.4), std({color:0x143A2C, roughness:.5}), 0,8.0,4.4*s);
     const face=new THREE.Mesh(new THREE.PlaneGeometry(8,2.5),signMat);
     face.position.set(0,8.0,(4.4+.21)*s); face.rotation.y=s>0?0:Math.PI;
     station.add(face);
   });
 
   // маркер-луч (виден сквозь туман — главный ориентир) и пульсирующее кольцо
+  const glow =new THREE.MeshBasicMaterial({color:0x7CFFC4});
   const beam=new THREE.Mesh(new THREE.CylinderGeometry(2.2,7,170,12,1,true),
     new THREE.MeshBasicMaterial({color:0x38FFB0,transparent:true,opacity:.13,
       side:THREE.DoubleSide,depthWrite:false,fog:false}));
@@ -1240,15 +1981,18 @@ stationGlow.scale.set(30,30,1); stationGlow.position.y=19.4; station.add(station
 
   const lamp=new THREE.PointLight(0x7CFFC4, 60, 90, 1.4); lamp.position.set(0,7,0);
   station.add(lamp); station.userData.lamp=lamp;
+  // белый свет навеса: ночью площадка под козырьком освещена, как у настоящей АЗС
+  const canopyLight=new THREE.PointLight(0xFFF1DD, 0, 26, 1.6); canopyLight.position.set(0,5.3,0);
+  station.add(canopyLight); station.userData.canopyLight=canopyLight;
 }
 
-// канистры
+// канистры — красные металлические, той же формы, что золотая на экране победы
 const cans=[];
 {
-  const g=new THREE.BoxGeometry(.8,1.1,.55);
-  const m=new THREE.MeshLambertMaterial({color:0xF2C230,flatShading:true,emissive:0x3a2a00});
   for(let i=0;i<6;i++){
-    const c=new THREE.Mesh(g,m); c.castShadow=true; c.visible=false; scene.add(c);
+    const c=new THREE.Group(); c.visible=false; scene.add(c);
+    const jc=buildJerrycan(0xC8241C,0x262626,.35,.4);
+    jc.scale.setScalar(.42); jc.traverse(o=>{ if(o.isMesh) o.castShadow=true; }); c.add(jc);
     const halo=new THREE.Mesh(new THREE.TorusGeometry(1.1,.07,5,18),
       new THREE.MeshBasicMaterial({color:0xFFD24A,transparent:true,opacity:.7}));
     halo.rotation.x=Math.PI/2; c.add(halo);
@@ -1258,8 +2002,15 @@ const cans=[];
 
 // следы шин (кольцевой буфер инстансов)
 const TRACK_N=520;
+const trackTex=canvasTex(32,64,d=>{
+  for(let y=0;y<64;y++) for(let x=0;x<32;x++){
+    const a=smooth(0,.35,Math.min(x,31-x)/31)*smooth(0,.25,Math.min(y,63-y)/63)*(.75+.25*NB(x/32*8,y/64*16,8,16));
+    put(d,(y*32+x)*4,1,1,1,a);
+  }
+});
 const tracks=new THREE.InstancedMesh(new THREE.PlaneGeometry(.5,1.6),
-  new THREE.MeshBasicMaterial({color:0x1D1A16,transparent:true,opacity:.32,depthWrite:false}), TRACK_N);
+  new THREE.MeshBasicMaterial({map:trackTex,color:0x1D1A16,transparent:true,opacity:.4,depthWrite:false,
+    polygonOffset:true,polygonOffsetFactor:-5,polygonOffsetUnits:-5}), TRACK_N);
 tracks.frustumCulled=false; scene.add(tracks);
 /* Буферы, которые переписываются каждый кадр, помечаем как динамические:
    по умолчанию three отдаёт их драйверу с подсказкой STATIC_DRAW, и тот
@@ -1284,39 +2035,46 @@ function addTrack(x,y,z,yaw){
   trackI=(trackI+1)%TRACK_N;
 }
 
-// пыль и выхлоп
+/* Пыль и выхлоп: мягкие клубы вместо квадратных точек. Альфа живёт в цвете
+   вершины и гаснет с возрастом, а сам клуб при этом разрастается (патч
+   gl_PointSize ниже) — так пыль рассеивается, а не исчезает. Цвет домножается
+   на освещённость в момент рождения: ночью пыль не светится сама по себе. */
 const DUST_N=260;
 const dustPos=new Float32Array(DUST_N*3), dustVel=new Float32Array(DUST_N*3),
-      dustLife=new Float32Array(DUST_N), dustCol=new Float32Array(DUST_N*3);
+      dustLife=new Float32Array(DUST_N), dustCol=new Float32Array(DUST_N*4), dustA=new Float32Array(DUST_N);
 const dustGeo=new THREE.BufferGeometry();
 dustGeo.setAttribute('position',new THREE.BufferAttribute(dustPos,3));
-dustGeo.setAttribute('color',   new THREE.BufferAttribute(dustCol,3));
+dustGeo.setAttribute('color',   new THREE.BufferAttribute(dustCol,4));
 dustGeo.attributes.position.setUsage(THREE.DynamicDrawUsage);
 dustGeo.attributes.color.setUsage(THREE.DynamicDrawUsage);
-const dust=new THREE.Points(dustGeo,new THREE.PointsMaterial({size:.62,vertexColors:true,
-  transparent:true,opacity:.55,depthWrite:false}));
+const dustMat=new THREE.PointsMaterial({size:1.5,map:TEX.puff,vertexColors:true,
+  transparent:true,depthWrite:false});
+dustMat.userData.nbOpt={key:'dust', vert:s=>s.replace('gl_PointSize = size;',
+  'gl_PointSize = size * (1.0 + (1.0 - color.a) * 2.2);')};
+const dust=new THREE.Points(dustGeo,dustMat);
 dust.frustumCulled=false; scene.add(dust);
 for(let i=0;i<DUST_N;i++) dustPos[i*3+1]=-500;
-let dustI=0;
-function spawnDust(x,y,z,r=0.79,g=0.70,b=0.54,up=1){
+let dustI=0, lightLevel=1;
+function spawnDust(x,y,z,r=0.79,g=0.70,b=0.54,up=1,alpha=.5){
   const i=dustI; dustI=(dustI+1)%DUST_N;
   dustPos[i*3]=x; dustPos[i*3+1]=y+.2; dustPos[i*3+2]=z;
   dustVel[i*3]=(Math.random()-.5)*2.2; dustVel[i*3+1]=(1+Math.random()*1.6)*up; dustVel[i*3+2]=(Math.random()-.5)*2.2;
-  dustCol[i*3]=r; dustCol[i*3+1]=g; dustCol[i*3+2]=b;
+  dustCol[i*4]=r*lightLevel; dustCol[i*4+1]=g*lightLevel; dustCol[i*4+2]=b*lightLevel; dustCol[i*4+3]=alpha;
+  dustA[i]=alpha;
   dustLife[i]=.9;
-  // цвета меняются только здесь, поэтому и заливка в GPU нужна только здесь;
-  // в цикле кадра она была холостой — три килобайта каждый кадр ни за чем
-  dustGeo.attributes.color.needsUpdate=true;
 }
 
-// искры от ударов
+// искры от ударов — ярче единицы, чтобы их подхватывал bloom
 const SPARK_N=140;
 const sparkPos=new Float32Array(SPARK_N*3), sparkVel=new Float32Array(SPARK_N*3), sparkLife=new Float32Array(SPARK_N);
 const sparkGeo=new THREE.BufferGeometry();
 sparkGeo.setAttribute('position',new THREE.BufferAttribute(sparkPos,3));
 sparkGeo.attributes.position.setUsage(THREE.DynamicDrawUsage);
-const sparks=new THREE.Points(sparkGeo,new THREE.PointsMaterial({color:0xFFB25A,size:.42,
-  transparent:true,opacity:.95,depthWrite:false,blending:THREE.AdditiveBlending}));
+const sparkMat=new THREE.PointsMaterial({size:.5,map:haloTex,
+  transparent:true,opacity:.95,depthWrite:false,blending:THREE.AdditiveBlending});
+sparkMat.color.setRGB(5,2,.6);
+sparkMat.userData.nbOpt={key:'spark', additive:true};
+const sparks=new THREE.Points(sparkGeo,sparkMat);
 sparks.frustumCulled=false; scene.add(sparks);
 for(let i=0;i<SPARK_N;i++) sparkPos[i*3+1]=-500;
 let sparkI=0;
@@ -1365,28 +2123,23 @@ function updateRain(dt){
 
 /* --- встречный трафик: катается по линиям дорог, переиспользуется вокруг игрока --- */
 const TRAFFIC_N=15, traffic=[];
-const tBody=new THREE.InstancedMesh(new THREE.BoxGeometry(2.0,.8,4.4),
-  new THREE.MeshLambertMaterial({flatShading:true}), TRAFFIC_N);
-const tCab =new THREE.InstancedMesh(new THREE.BoxGeometry(1.7,.6,2.0),
-  new THREE.MeshLambertMaterial({color:0x2C3E4A,flatShading:true}), TRAFFIC_N);
-tBody.castShadow=tCab.castShadow=true; tBody.frustumCulled=tCab.frustumCulled=false;
-scene.add(tBody); scene.add(tCab);
+const tMesh=(geo,mat,n,shadow)=>{ const m=new THREE.InstancedMesh(geo,mat,n);
+  m.castShadow=shadow; m.receiveShadow=shadow; m.frustumCulled=false;
+  m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); scene.add(m); return m; };
+const tBody =tMesh(CAR.paint, new THREE.MeshPhysicalMaterial({metalness:.4, roughness:.36,
+  clearcoat:1, clearcoatRoughness:.06}), TRAFFIC_N, true);
+const tGlass=tMesh(CAR.glass, MAT.glass, TRAFFIC_N, true);
+const tTrim =tMesh(CAR.trim,  MAT.trim,  TRAFFIC_N, true);
+const tShadow=tMesh(SHADOW_GEO, MAT.shadow, TRAFFIC_N, false);
 // фары и стопы трафика — по два инстанса на машину (левый/правый), индексы i*2, i*2+1
-const tHead=new THREE.InstancedMesh(HEAD_GEO,
-  new THREE.MeshBasicMaterial({color:0xFFF0C0}), TRAFFIC_N*2);
-const tTail=new THREE.InstancedMesh(TAIL_GEO,
-  new THREE.MeshBasicMaterial({color:0xC22A1E}), TRAFFIC_N*2);
-tHead.frustumCulled=tTail.frustumCulled=false;
-scene.add(tHead); scene.add(tTail);
+const tHead=tMesh(HEAD_GEO, MAT.head, TRAFFIC_N*2, false);
+const tTail=tMesh(TAIL_GEO, MAT.tail, TRAFFIC_N*2, false);
 // колёса трафика — четыре инстанса на машину, индексы i*4 .. i*4+3
-const TWHEEL=[[-.95,-1.5],[.95,-1.5],[-.95,1.5],[.95,1.5]];
-const tWheel=new THREE.InstancedMesh(WHEEL_GEO,
-  new THREE.MeshLambertMaterial({color:0x23272C,flatShading:true}), TRAFFIC_N*4);
-tWheel.castShadow=true; tWheel.frustumCulled=false;
-scene.add(tWheel);
-[tBody,tCab,tHead,tTail,tWheel].forEach(m=>m.instanceMatrix.setUsage(THREE.DynamicDrawUsage));
+const tTire=tMesh(CAR.tire, MAT.tire, TRAFFIC_N*4, true);
+const tRim =tMesh(CAR.rim,  MAT.rim,  TRAFFIC_N*4, false);
+const T_ALL=[tBody,tGlass,tTrim,tShadow,tHead,tTail,tTire,tRim];
 {
-  const palette=[0xB8422F,0x2F6FB8,0xE0E2E4,0x3F7A46,0x8A8F96,0xE0A423];
+  const palette=[0xB8422F,0x2F6FB8,0xE0E2E4,0x3F7A46,0x8A8F96,0xE0A423,0x1C1E22,0x7A1E22];
   const c=new THREE.Color();
   for(let i=0;i<TRAFFIC_N;i++){
     traffic.push({x:0,z:0,yaw:0,v:14,axis:0,dir:1,line:0,alive:false,spin:0});
@@ -1399,7 +2152,7 @@ const tDum=new THREE.Object3D();
 // иначе на машинах, едущих вдоль X, колёса крутились бы «в сторону».
 tDum.rotation.order='YXZ';
 
-// поставить инстанс детали: локальное смещение (lx,ly,lz) от центра кузова
+// поставить инстанс детали: локальное смещение (lx,ly,lz) от точки машины на земле
 function setPart(mesh,idx,x,y,z,yaw,sy,cy,lx,ly,lz,pitch){
   tDum.position.set(x+lx*cy+lz*sy, y+ly, z-lx*sy+lz*cy);
   tDum.rotation.set(pitch||0,yaw,0); tDum.scale.set(1,1,1);
@@ -1431,32 +2184,35 @@ function updateTraffic(dt){
     const t=traffic[i];
     if(!t.alive){ if(Math.random()<dt*1.5) spawnTraffic(t); }
     if(!t.alive){ tDum.position.set(0,-500,0); tDum.rotation.set(0,0,0); tDum.updateMatrix();
-      tBody.setMatrixAt(i,tDum.matrix); tCab.setMatrixAt(i,tDum.matrix);
-      tHead.setMatrixAt(i*2,tDum.matrix);   tHead.setMatrixAt(i*2+1,tDum.matrix);
-      tTail.setMatrixAt(i*2,tDum.matrix);   tTail.setMatrixAt(i*2+1,tDum.matrix);
-      for(let w=0;w<4;w++) tWheel.setMatrixAt(i*4+w,tDum.matrix); continue; }
+      tBody.setMatrixAt(i,tDum.matrix); tGlass.setMatrixAt(i,tDum.matrix);
+      tTrim.setMatrixAt(i,tDum.matrix); tShadow.setMatrixAt(i,tDum.matrix);
+      for(let k=0;k<2;k++){ tHead.setMatrixAt(i*2+k,tDum.matrix); tTail.setMatrixAt(i*2+k,tDum.matrix); }
+      for(let w=0;w<4;w++){ tTire.setMatrixAt(i*4+w,tDum.matrix); tRim.setMatrixAt(i*4+w,tDum.matrix); }
+      continue; }
 
     if(t.axis===0) t.z += t.dir*t.v*dt; else t.x += t.dir*t.v*dt;
     const d2=(t.x-S.x)**2+(t.z-S.z)**2;
     if(d2>620*620 || Math.abs(t.x)>MAP-40 || Math.abs(t.z)>MAP-40){ t.alive=false; continue; }
 
+    // кузов, стёкла, пластик и тень-пятно стоят в одной точке — одна матрица на всё
     const y=heightAt(t.x,t.z);
-    tDum.position.set(t.x,y+.75,t.z); tDum.rotation.set(0,t.yaw,0); tDum.scale.set(1,1,1);
-    tDum.updateMatrix(); tBody.setMatrixAt(i,tDum.matrix);
-    tDum.position.y=y+1.45; tDum.position.x-=Math.sin(t.yaw)*.3; tDum.position.z-=Math.cos(t.yaw)*.3;
-    tDum.updateMatrix(); tCab.setMatrixAt(i,tDum.matrix);
+    tDum.position.set(t.x,y,t.z); tDum.rotation.set(0,t.yaw,0); tDum.scale.set(1,1,1);
+    tDum.updateMatrix();
+    tBody.setMatrixAt(i,tDum.matrix); tGlass.setMatrixAt(i,tDum.matrix);
+    tTrim.setMatrixAt(i,tDum.matrix); tShadow.setMatrixAt(i,tDum.matrix);
 
-    // фары спереди (+Z по курсу) и парные тонкие стопы сзади
-    const sy=Math.sin(t.yaw), cy=Math.cos(t.yaw), cyY=y+.75;
-    setPart(tHead,i*2,   t.x,cyY,t.z,t.yaw,sy,cy, -.62,-.03, 2.24);
-    setPart(tHead,i*2+1, t.x,cyY,t.z,t.yaw,sy,cy,  .62,-.03, 2.24);
-    setPart(tTail,i*2,   t.x,cyY,t.z,t.yaw,sy,cy, -.62, .15,-2.24);
-    setPart(tTail,i*2+1, t.x,cyY,t.z,t.yaw,sy,cy,  .62, .15,-2.24);
-
-    // колёса: центр на .45 над землёй, накат по пройденному пути
-    t.spin=(t.spin+t.v*dt/.45)%6.283185;
-    for(let w=0;w<4;w++)
-      setPart(tWheel,i*4+w, t.x,cyY,t.z,t.yaw,sy,cy, TWHEEL[w][0],-.30,TWHEEL[w][1], t.spin);
+    // фары спереди (+Z по курсу) и парные стопы сзади
+    const sy=Math.sin(t.yaw), cy=Math.cos(t.yaw);
+    for(let k=0;k<2;k++){
+      setPart(tHead,i*2+k, t.x,y,t.z,t.yaw,sy,cy, ...HEAD_POS[k]);
+      setPart(tTail,i*2+k, t.x,y,t.z,t.yaw,sy,cy, ...TAIL_POS[k]);
+    }
+    // колёса: накат по пройденному пути
+    t.spin=(t.spin+t.v*dt/WHEEL_R)%6.283185;
+    for(let w=0;w<4;w++){
+      setPart(tTire,i*4+w, t.x,y,t.z,t.yaw,sy,cy, WHEEL_POS[w][0],WHEEL_R,WHEEL_POS[w][1], t.spin);
+      setPart(tRim, i*4+w, t.x,y,t.z,t.yaw,sy,cy, WHEEL_POS[w][0],WHEEL_R,WHEEL_POS[w][1], t.spin);
+    }
 
     // столкновение с игроком
     if(d2<12 && S.mode==='play'){
@@ -1466,9 +2222,57 @@ function updateTraffic(dt){
       t.alive=false;
     }
   }
-  tBody.instanceMatrix.needsUpdate=true; tCab.instanceMatrix.needsUpdate=true;
-  tHead.instanceMatrix.needsUpdate=true; tTail.instanceMatrix.needsUpdate=true;
-  tWheel.instanceMatrix.needsUpdate=true;
+  T_ALL.forEach(m=>m.instanceMatrix.needsUpdate=true);
+}
+
+/* Все материалы сцены получают общий патч (туман, тени облаков, мировая
+   позиция). Звать после того, как собрано всё, что лежит в сцене. */
+scene.traverse(o=>{
+  const ms=Array.isArray(o.material)?o.material:[o.material];
+  for(const m of ms) if(m && !m.isShaderMaterial && !m.isSpriteMaterial) enhance(m, m.userData.nbOpt||{});
+});
+
+/* --- постобработка: bloom, сглаживание, плёнка ---
+   Модули грузятся динамически и необязательны: если CDN с аддонами не ответит,
+   игра рисуется напрямую, как раньше, просто без свечения и виньетки. */
+let composer=null, gradePass=null;
+(async()=>{
+  try{
+    const P='three/addons/postprocessing/';
+    const [{EffectComposer},{RenderPass},{UnrealBloomPass},{OutputPass},{ShaderPass},{SMAAPass}] = await Promise.all(
+      ['EffectComposer','RenderPass','UnrealBloomPass','OutputPass','ShaderPass','SMAAPass'].map(n=>import(P+n+'.js')));
+    /* Канвасное MSAA в цепочке постобработки теряется, а MSAA на HDR-буфере
+       съедало на слабой графике четверть кадров. SMAA после тональной
+       компрессии даёт почти то же сглаживание за малую долю цены. */
+    const c=new EffectComposer(renderer);
+    c.addPass(new RenderPass(scene, camera));
+    c.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth/2, innerHeight/2), .42, .5, .92));
+    c.addPass(new OutputPass());
+    c.addPass(new SMAAPass());
+    /* Плёнка: виньетка, чуть заметная хроматическая аберрация к краям кадра
+       и зерно. Идёт после OutputPass — в итоговых sRGB-значениях. */
+    gradePass=new ShaderPass({
+      uniforms:{ tDiffuse:{value:null}, uTime:{value:0}, uRes:{value:new THREE.Vector2(1,1)} },
+      vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+      fragmentShader:`uniform sampler2D tDiffuse; uniform float uTime; uniform vec2 uRes; varying vec2 vUv;
+        void main(){
+          vec2 d=vUv-0.5; float r2=dot(d,d);
+          vec2 off=d*r2*0.006;
+          vec3 c=vec3(texture2D(tDiffuse,vUv+off).r, texture2D(tDiffuse,vUv).g, texture2D(tDiffuse,vUv-off).b);
+          c*=mix(1.0, smoothstep(0.95, 0.15, r2*1.8), 0.55);
+          float n=fract(sin(dot(vUv*uRes + fract(uTime)*97.0, vec2(12.9898,78.233)))*43758.5453);
+          c+=(n-0.5)*0.028;
+          gl_FragColor=vec4(c,1.0);
+        }`
+    });
+    c.addPass(gradePass);
+    composer=c;
+    resize();
+  }catch(e){ composer=null; console.warn('Постобработка недоступна, рисуем напрямую', e); }
+})();
+function render(){
+  if(composer && hiQuality){ gradePass.uniforms.uTime.value=clock.elapsedTime; composer.render(); }
+  else renderer.render(scene,camera);
 }
 
 /* ============================================================
@@ -1525,10 +2329,19 @@ function toggleSound(){
   const b=document.getElementById('o-sound');
   if(b) b.textContent='ЗВУК: '+(S.muted?'ВЫКЛ':'ВКЛ');
 }
-let shadowsOn=true, hiQuality=true;
+let shadowsOn=true, hiQuality=!COARSE;
 function applyQuality(){
   renderer.shadowMap.enabled=shadowsOn;
   renderer.setPixelRatio(hiQuality?Math.min(devicePixelRatio,1.75):1);
+  /* Высокое качество: постобработка, густая трава, карта теней 4096.
+     Быстрое: без постобработки, трава втрое реже, карта 2048. Карту теней
+     приходится пересоздать — three выделяет её один раз под mapSize. */
+  grass.geometry.instanceCount = hiQuality ? GRASS_MAX : Math.floor(GRASS_MAX/3);
+  const sm = hiQuality ? 4096 : 2048;
+  if(sun.shadow.mapSize.x!==sm){
+    sun.shadow.mapSize.set(sm,sm);
+    if(sun.shadow.map){ sun.shadow.map.dispose(); sun.shadow.map=null; }
+  }
   scene.traverse(o=>{ if(o.material){ const m=o.material;
     (Array.isArray(m)?m:[m]).forEach(x=>x.needsUpdate=true); } });
   const a=document.getElementById('o-shadow'), b=document.getElementById('o-quality');
@@ -2056,12 +2869,13 @@ const sunDir=new THREE.Vector3(), camFwd=new THREE.Vector3(), sunScreen=new THRE
 /* Рабочие объекты кадра. Раньше на каждый кадр создавались три Vector3 и один
    Color — за час игры это пара миллионов короткоживущих объектов на ровном месте. */
 const camWant=new THREE.Vector3(), camLook=new THREE.Vector3();
-const WHITE=new THREE.Color(0xFFFFFF);
 const wetLens=document.getElementById('wetlens');
 const flare={ el:document.getElementById('flare'),
               parts:[...document.querySelectorAll('#flare i')],
               k:[1, 0.55, -0.25, -0.7] };   // положение бликов на линии «солнце → центр экрана»
-let lampEmissive=0, fpsAcc=0, fpsFrames=0, fps=60;
+let debugCam=null;             // только для #debug: ручная камера для осмотра сцены
+let lampEmissive=0, fpsAcc=0, fpsFrames=0, fps=60, envKey="";
+const CULL_R2=(VIEW+CH*0.8)**2;
 
 function tick(){
   requestAnimationFrame(tick);
@@ -2072,7 +2886,7 @@ function tick(){
   fpsAcc+=dt; fpsFrames++;
   if(fpsAcc>0.5){ fps=Math.round(fpsFrames/fpsAcc); fpsAcc=0; fpsFrames=0; el.fps.textContent=fps; }
 
-  if(S.paused){ renderer.render(scene,camera); return; }
+  if(S.paused){ render(); return; }
 
   if(S.mode==='play'||S.mode==='refuel'){
     S.time+=dt;
@@ -2191,9 +3005,10 @@ function tick(){
     car.rotation.set(Math.atan2(hB-hF,4.2)+S.pitchD, S.yaw, Math.atan2(hL-hR,2.2)+S.rollD);
 
     // колёса: поворот + вращение
-    const spin=S.speed*dt/0.45;
+    const spin=S.speed*dt/WHEEL_R;
     wheels.forEach(w=>{ w.rotation.x-=spin; if(w.userData.front) w.rotation.y=S.steer; });
-    car.userData.tailMat.color.setHex(input.b||input.hand?0xFF4436:0x8E1B12);
+    // стопы: в темноте горят габаритом, при торможении — в полную силу (ореол даёт bloom)
+    car.userData.tailMat.emissiveIntensity = (input.b||input.hand) ? 5 : Math.max(S.night,S.rain*0.7)*1.4;
 
     /* --- следы, пыль, выхлоп --- */
     const sliding=Math.abs(S.lat)>2.4;
@@ -2207,7 +3022,7 @@ function tick(){
     if(throttle>0 && Math.random()<0.55){
       const ex=S.x-Math.sin(S.yaw)*2.3+Math.cos(S.yaw)*0.5;
       const ez=S.z-Math.cos(S.yaw)*2.3-Math.sin(S.yaw)*0.5;
-      spawnDust(ex, car.position.y+0.5, ez, .42,.44,.46, .5);
+      spawnDust(ex, car.position.y+0.5, ez, .42,.44,.46, .5, .28);
     }
 
     /* --- звук двигателя и покрышек --- */
@@ -2237,10 +3052,12 @@ function tick(){
       dustPos[i*3+1]+=dustVel[i*3+1]*dt;
       dustPos[i*3+2]+=dustVel[i*3+2]*dt;
       dustVel[i*3+1]-=1.6*dt;
+      dustCol[i*4+3]=dustA[i]*Math.max(dustLife[i],0)/0.9;   // клуб тает к концу жизни
       if(dustLife[i]<=0) dustPos[i*3+1]=-500;
     }
   }
   dustGeo.attributes.position.needsUpdate=true;
+  dustGeo.attributes.color.needsUpdate=true;
 
   /* --- искры --- */
   for(let i=0;i<SPARK_N;i++){
@@ -2264,6 +3081,9 @@ function tick(){
   station.userData.beam.material.opacity =
     (0.10+Math.sin(t*2.2)*0.03+S.night*0.07) * clamp((820-stD)/320,0,1);
   station.userData.lamp.intensity=50+Math.sin(t*3)*14+S.night*90;
+  station.userData.canopyLight.intensity=Math.max(S.night,S.rain*0.6)*140;
+  station.userData.panelMat.emissiveIntensity=1.2+S.night*5;
+  grass.userData.uni.uStation.value.set(stationPos.x, stationPos.z);
   cans.forEach(k=>{ if(!k.taken){ k.mesh.rotation.y=t*1.6; k.mesh.position.y=heightAt(k.mesh.position.x,k.mesh.position.z)+.75+Math.sin(t*2+k.mesh.id)*0.12; }});
 
   /* --- дождь: эпизоды с 6-й АЗС --- */
@@ -2279,10 +3099,11 @@ function tick(){
     if(S.mode==='play' && Math.random()<S.rain*0.9){
       const a=Math.random()*6.283, r=4+Math.random()*22;
       const sx=S.x+Math.cos(a)*r, sz=S.z+Math.sin(a)*r;
-      spawnDust(sx, heightAt(sx,sz), sz, .76,.87,.94, .55);
+      spawnDust(sx, heightAt(sx,sz), sz, .76,.87,.94, .55, .22);
     }
   }
   wetLens.style.opacity=(S.rain*0.85).toFixed(2);
+  U.uWet.value=S.rain;
   // мокрый асфальт и трава темнеют
   wetMats.forEach(w=>w.mat.color.copy(w.base).multiplyScalar(1-S.rain*0.34));
   Sfx.rain(S.rain);
@@ -2308,13 +3129,12 @@ function tick(){
   scene.fog.color.copy(cFog);
   scene.fog.far = VIEW*(1-S.rain*0.38);
   renderer.setClearColor(cFog);
-  sun.intensity=lerp(2.8,0.34,gloom)*(1+dusk*0.25);
+  sun.intensity=lerp(3.2,0.5,gloom)*(1+dusk*0.2);
   palette(sun.color,'sun',gloom,dusk);
-  /* Дождь гасит солнце через gloom, но заполнение при этом придерживается:
-     пасмурно — это рассеянный свет, а не темнота, иначе ливень днём уходит в ночь.
-     Прибавка 0.18, а не больше: ночной конец шкалы поднят до 0.42, и при
-     прежних 0.30 дневной ливень получал заполнения больше, чем ясный полдень. */
-  hemi.intensity=lerp(0.7,0.42,gloom)+S.rain*0.18*(1-S.night);
+  /* Днём рассеянный свет даёт карта окружения, полусфера — лишь отражённый
+     от травы подсвет. Ночью небо почти чёрное, и читаемость земли держит она.
+     В дождь небо серое и светлое — окружение само даёт пасмурный рассеянный свет. */
+  hemi.intensity=lerp(0.3,0.85,gloom)+S.rain*0.12*(1-S.night);
   palette(hemi.color,'amb',gloom,dusk);
   starMat.opacity=S.night*(1-S.rain)*0.9;
   /* Мерцание: две синусоиды несовпадающих периодов, поэтому рисунок не повторяется
@@ -2331,18 +3151,28 @@ function tick(){
     }
     starGeo.attributes.color.needsUpdate=true;
   }
-  car.userData.beams.forEach(b=>b.intensity=Math.max(S.night,S.rain*0.7)*260);
+  car.userData.beams.forEach(b=>b.intensity=Math.max(S.night,S.rain*0.7)*200);
   lampEmissive=Math.max(S.night,S.rain*0.8);
-  if(lampMat) lampMat.emissive.setRGB(lampEmissive*0.95, lampEmissive*0.8, lampEmissive*0.45);
+  /* Плафоны, окна и фары светятся ярче единицы — их ловит bloom. Ореолы-спрайты
+     остались для режима без постобработки, с ней они приглушены. */
+  const post = composer && hiQuality ? 0.45 : 1;
+  const lights = Math.max(S.night,S.rain*0.7);
+  if(lampMat) lampMat.emissive.setRGB(lampEmissive*4.2, lampEmissive*3.4, lampEmissive*1.9);
   // окна теплее и слабее уличных плафонов — свет из комнаты, а не фонарь
-  if(winMat)  winMat.emissive.setRGB(lampEmissive*0.80, lampEmissive*0.55, lampEmissive*0.22);
-  lampGlow.material.opacity=lampEmissive*0.55;
-  headGlow.forEach(h=>h.material.opacity=Math.max(S.night,S.rain*0.7)*0.85);
+  if(winMat)  winMat.emissive.setRGB(lampEmissive*1.3, lampEmissive*0.85, lampEmissive*0.35);
+  lampGlow.material.opacity=lampEmissive*0.55*post;
+  lampPools.material.opacity=lampEmissive*0.3;
+  // фары светят вперёд: из-за спины машины ореолов не видно
+  camera.getWorldDirection(camFwd);
+  const faceOn=smooth(0.1,0.6,-(camFwd.x*Math.sin(S.yaw)+camFwd.z*Math.cos(S.yaw)));
+  headGlow.forEach(h=>h.material.opacity=lights*0.85*post*faceOn);
+  car.userData.headMat.emissiveIntensity=lights*6;
+  MAT.head.emissiveIntensity=lights*6;
+  MAT.tail.emissiveIntensity=lights*1.4;
   stationGlow.material.opacity=0.35+S.night*0.5;
-
-  // задник: облака подкрашиваются тем же светом
-  cloudMat.color.copy(cHor).lerp(WHITE, 0.25*(1-gloom));
-  cloudMat.opacity=0.28+0.32*(1-gloom);
+  station.userData.signMat.color.setScalar(1+S.night*1.6);
+  // освещённость для пыли: ночью клубы не должны светиться сами
+  lightLevel=clamp(1-gloom*0.85,0.12,1);
 
   /* --- солнце ходит по кругу и следует за машиной (тени всегда рядом) --- */
   const sa=phase*Math.PI*2;
@@ -2356,7 +3186,23 @@ function tick(){
   // а не в блоке палитры выше: там sun.position ещё прошлого кадра
   sky.material.uniforms.sunDir.value.copy(sunDir);
   sky.material.uniforms.sunCol.value.copy(sun.color);
-  sky.material.uniforms.glow.value=(1-S.night)*(1-S.rain*0.85);
+  const skyU=sky.material.uniforms, glow=(1-S.night)*(1-S.rain*0.85);
+  skyU.glow.value=glow;
+  skyU.night.value=S.night*(1-S.rain*0.9);
+  skyU.cover.value=lerp(0.6, 0.2, S.rain);                // в дождь небо затягивает
+  skyU.moonDir.value.set(-sunDir.x, Math.abs(sunDir.y)*0.7+0.16, -sunDir.z).normalize();
+  // земля в карте окружения: трава, освещённая тем же солнцем и небом
+  skyU.groundCol.value.setRGB(.05,.07,.03).multiplyScalar(0.15+sun.intensity*0.35);
+  // общие униформы патча: туман со стороны солнца, тени облаков, ветер
+  U.uTime.value=t;
+  U.uSunDir.value.copy(sunDir);
+  U.uScatter.value.copy(sun.color).multiplyScalar(glow*0.45);
+  U.uCloudOff.value.set(t*0.0011, t*0.0004);
+  U.uCloudShadow.value=0.4*glow*(1-S.rain);
+  /* Карта окружения — пересчёт, только когда небо заметно сдвинулось:
+     полный прогон PMREM на каждом кадре был бы дорог, а небо меняется медленно. */
+  const envSig=Math.round(sunDir.x*20)+","+Math.round(sunDir.z*20)+","+Math.round(gloom*25)+","+Math.round(dusk*20)+","+Math.round(S.rain*10);
+  if(envSig!==envKey){ envKey=envSig; updateEnv(); }
   {
     const day=(1-S.night)*(1-S.rain*0.85);
     let vis=0, sx=0, sy=0;
@@ -2370,7 +3216,8 @@ function tick(){
         vis=day*Math.pow(clamp((facing-0.12)/0.88,0,1),1.6);
       }
     }
-    flare.el.style.opacity=vis.toFixed(3);
+    // с постобработкой солнце и так даёт ореол через bloom — экранный блик слабее
+    flare.el.style.opacity=(vis*(composer&&hiQuality?0.55:1)).toFixed(3);
     if(vis>0.01){
       const cx=innerWidth/2, cy=innerHeight/2;
       flare.parts.forEach((p,i)=>{
@@ -2402,24 +3249,19 @@ function tick(){
   camAim.lerp(camLook.set(car.position.x+Math.sin(S.yaw)*7, car.position.y+2.1, car.position.z+Math.cos(S.yaw)*7),
     1-Math.exp(-7*dt));
   camera.lookAt(camAim);
+  if(debugCam){ camera.position.set(...debugCam.p); camera.lookAt(...debugCam.l); }
   sky.position.copy(camera.position); stars.position.copy(camera.position);
-  backdrop.position.set(camera.position.x, 0, camera.position.z);
-  // облака медленно плывут и заворачиваются
-  clouds.forEach((c,i)=>{
-    c.position.x += (5+i*0.6)*dt;
-    if(c.position.x>1000) c.position.x=-1000;
-  });
-  // диски светил на своих направлениях
-  sunDisc.position.copy(sunDir).multiplyScalar(1150);
-  sunDisc.position.y=Math.max(sunDisc.position.y,-60);
-  sunDisc.material.opacity=clamp(1-S.night*1.3,0,1)*(1-S.rain*0.8);
-  sunDisc.material.color.copy(DAY.sun).lerp(DUSK.sun, dusk);
-  moonDisc.position.copy(sunDir).multiplyScalar(-1150); moonDisc.position.y=Math.abs(moonDisc.position.y)*0.7+180;
-  moonDisc.material.opacity=S.night*(1-S.rain*0.9)*0.9;
+  // трава растёт вокруг точки чуть впереди машины — туда смотрит камера
+  grass.userData.uni.uGC.value.set(car.position.x+Math.sin(S.yaw)*16, car.position.z+Math.cos(S.yaw)*16);
+  // дальние чанки статики не рисуем вовсе — ни в кадре, ни в тенях: их всё равно съел бы туман
+  for(const m of chunkList){
+    const dx=m.userData.cx-camera.position.x, dz=m.userData.cz-camera.position.z;
+    m.visible = dx*dx+dz*dz < CULL_R2;
+  }
 
   updateHud(!onRoad(S.x,S.z));
   drawMinimap();
-  renderer.render(scene,camera);
+  render();
   if(trophy) trophy.tick(dt);
   if(conf) confettiTick(dt);
 }
@@ -2430,10 +3272,11 @@ function tick(){
    Контекст создаётся лениво, только когда игрок действительно дошёл до конца. */
 let trophy=null;
 
-function buildJerrycan(){
+// по умолчанию — золотая для экрана победы; на карте та же форма в красной краске
+function buildJerrycan(col=0xFFC24A, trimCol=0xB07E1C, metal=1, rough=.27){
   const G=new THREE.Group();
-  const gold=new THREE.MeshStandardMaterial({color:0xFFC24A,metalness:1,roughness:.27});
-  const trim=new THREE.MeshStandardMaterial({color:0xB07E1C,metalness:1,roughness:.44});
+  const gold=new THREE.MeshStandardMaterial({color:col,metalness:metal,roughness:rough});
+  const trim=new THREE.MeshStandardMaterial({color:trimCol,metalness:metal,roughness:rough+.17});
 
   /* Корпус: контур со скруглёнными углами + фаска по торцам.
      RoundedBoxGeometry живёт в addons — лишний импорт с CDN уронил бы всю игру,
@@ -2653,6 +3496,10 @@ function resize(){
   const w=innerWidth,h=innerHeight;
   renderer.setSize(w,h,false);
   camera.aspect=w/h; camera.updateProjectionMatrix();
+  if(composer){
+    composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(w,h);
+    gradePass.uniforms.uRes.value.set(w*renderer.getPixelRatio(), h*renderer.getPixelRatio());
+  }
 }
 addEventListener('resize',resize); resize();
 
@@ -2668,6 +3515,9 @@ applyQuality();
 placeStation(); placeCans();
 car.position.set(S.x,heightAt(S.x,S.z),S.z);
 camPos.set(0,10,-16);
+// отладочный доступ к состоянию — только по адресу с #debug (скриншоты, подбор света)
+if(location.hash==="#debug") window.__nb={S, scene, renderer, camera, grass, sun, chunkList, traffic,
+  get composer(){ return composer; }, set cam(v){ debugCam=v; }, car, heightAt, stationPos, setHi(v){ hiQuality=v; applyQuality(); resize(); }};
 tick();
 </script>
 </body>
