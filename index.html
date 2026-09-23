@@ -525,6 +525,30 @@ function heightAt(x,z){
               : h00+(h11-h01)*u+(h01-h00)*v;
 }
 
+/* Дорожные ленты лежат над рельефом (асфальт +0.14, гравий +0.10) и строятся
+   по опорным точкам через 24 м — вдвое реже ячейки рельефа, поэтому между
+   опорами расходятся с heightAt() ещё до 11 см. Колёса ставим на то, что
+   нарисовано: та же сетка, те же треугольники (диагональ b-cc), что в ribbon(). */
+const ROAD_Y=.14, GRAVEL_Y=.10, GRAVEL_W=3.2, RIB_STEP=CELL*2;
+function ribbonY(f,s,t,s0,s1,alongZ){
+  const i=Math.floor((t+MAP)/RIB_STEP), t0=-MAP+i*RIB_STEP, v=(t-t0)/RIB_STEP, u=(s-s0)/(s1-s0);
+  const h=(ss,tt)=>alongZ ? heightAt(f+ss,tt) : heightAt(tt,f+ss);
+  const A=h(s0,t0), B=h(s1,t0), C=h(s0,t0+RIB_STEP), D=h(s1,t0+RIB_STEP);
+  return u+v<=1 ? A+(B-A)*u+(C-A)*v : D+(C-D)*(1-u)+(B-D)*(1-v);
+}
+// верх асфальта или гравия в точке; -Infinity — вне дороги
+function roadTop(x,z){
+  let top=-Infinity;
+  for(const alongZ of [true,false]){
+    const a=alongZ?x:z, t=alongZ?z:x, f=Math.round(a/ROAD_STEP)*ROAD_STEP, s=a-f, d=Math.abs(s), sg=Math.sign(s)||1;
+    if(d>ROAD_HALF+GRAVEL_W) continue;
+    top=Math.max(top, d<=ROAD_HALF
+      ? ribbonY(f,s,t, sg<0?-ROAD_HALF:0, sg<0?0:ROAD_HALF, alongZ)+ROAD_Y
+      : ribbonY(f,s,t, sg<0?-ROAD_HALF-GRAVEL_W:ROAD_HALF, sg<0?-ROAD_HALF:ROAD_HALF+GRAVEL_W, alongZ)+GRAVEL_Y);
+  }
+  return top;
+}
+
 /* ============================================================
    2. ЗВУК — полностью процедурный Web Audio, без файлов
    ============================================================ */
@@ -1207,7 +1231,7 @@ const hashXZ=(x,z,salt=0)=>hash01(Math.round(x*10)+salt*7919, Math.round(z*10)-s
 
 /* --- дороги: асфальт + гравийная кромка + краевая разметка --- */
 {
-  const STEPS=SEG/2, step=CELL*2;
+  const STEPS=SEG/2, step=RIB_STEP;
   // универсальный построитель ленты между двумя боковыми смещениями.
   // axis: 'x' — ленты вдоль Z (линия x=const), 'z' — вдоль X
   function ribbon(cols, yOff, vLen, axes){
@@ -1243,8 +1267,8 @@ const hashXZ=(x,z,salt=0)=>hash01(Math.round(x*10)+salt*7919, Math.round(z*10)-s
   const gravelMat=decal({map:TEX.gravel, normalMap:TEX.gravelN, roughness:1, color:0xC9BCA0});
   gravelMat.userData.nbOpt={key:'gravel', frag:s=>s.replace('#include <roughnessmap_fragment>',
     '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.55, uWet);')};
-  [[-ROAD_HALF-3.2,-ROAD_HALF],[ROAD_HALF,ROAD_HALF+3.2]].forEach(cols=>{
-    const m=new THREE.Mesh(ribbon(cols,0.10,1.6,['x','z']), gravelMat);
+  [[-ROAD_HALF-GRAVEL_W,-ROAD_HALF],[ROAD_HALF,ROAD_HALF+GRAVEL_W]].forEach(cols=>{
+    const m=new THREE.Mesh(ribbon(cols,GRAVEL_Y,1.6,['x','z']), gravelMat);
     m.receiveShadow=true; world.add(m);
   });
 
@@ -1271,7 +1295,7 @@ const hashXZ=(x,z,salt=0)=>hash01(Math.round(x*10)+salt*7919, Math.round(z*10)-s
   const roadA=decal(roadTex,-2), roadB=decal(roadTex,-3);
   roadA.userData.nbOpt=roadB.userData.nbOpt=roadOpt;
   [[roadA,'x'],[roadB,'z']].forEach(([m,ax])=>{
-    const r=new THREE.Mesh(ribbon([-ROAD_HALF,0,ROAD_HALF],0.14,36,[ax]), m);
+    const r=new THREE.Mesh(ribbon([-ROAD_HALF,0,ROAD_HALF],ROAD_Y,36,[ax]), m);
     r.receiveShadow=true; world.add(r);
   });
 
@@ -2061,7 +2085,7 @@ function clearTracks(){
 }
 clearTracks();
 function addTrack(x,y,z,yaw){
-  tDummy.position.set(x,y+.20,z); tDummy.rotation.set(-Math.PI/2,yaw,0);
+  tDummy.position.set(x,y+.06,z); tDummy.rotation.set(-Math.PI/2,yaw,0);
   tDummy.scale.set(1,1,1); tDummy.updateMatrix();
   tracks.setMatrixAt(trackI,tDummy.matrix); tracks.instanceMatrix.needsUpdate=true;
   trackI=(trackI+1)%TRACK_N;
@@ -2227,7 +2251,7 @@ function updateTraffic(dt){
     if(d2>620*620 || Math.abs(t.x)>MAP-40 || Math.abs(t.z)>MAP-40){ t.alive=false; continue; }
 
     // кузов, стёкла, пластик и тень-пятно стоят в одной точке — одна матрица на всё
-    const y=heightAt(t.x,t.z);
+    const y=groundAt(t.x,t.z);
     tDum.position.set(t.x,y,t.z); tDum.rotation.set(0,t.yaw,0); tDum.scale.set(1,1,1);
     tDum.updateMatrix();
     tBody.setMatrixAt(i,tDum.matrix); tGlass.setMatrixAt(i,tDum.matrix);
@@ -2583,10 +2607,10 @@ function seatStation(x,z,rot,span){
   newSearchZone();
 }
 
-// Грунт под колёсами: на площадке — её бетон, вокруг — пандус 1.5 м,
-// чтобы машина въезжала на фундамент, а не проваливалась в него
+// Грунт под колёсами: на дороге — асфальт и гравий, на площадке АЗС — её бетон,
+// вокруг площадки пандус 1.5 м, чтобы машина въезжала на фундамент, а не тонула
 function groundAt(x,z){
-  const h=heightAt(x,z), dx=x-stationPos.x, dz=z-stationPos.z;
+  const h=Math.max(heightAt(x,z), roadTop(x,z)), dx=x-stationPos.x, dz=z-stationPos.z;
   if(dx*dx+dz*dz>20*20) return h;
   const c=Math.cos(station.rotation.y), s=Math.sin(station.rotation.y);
   const out=Math.max(Math.abs(dx*c-dz*s)-PAD_W/2, Math.abs(dx*s+dz*c)-PAD_D/2);
