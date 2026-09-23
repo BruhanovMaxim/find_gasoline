@@ -2659,19 +2659,17 @@ function placeStation(){
     const dist=d*(0.85+Math.random()*0.3)*(relaxed?0.65:1);
     let x=clamp(S.x+Math.cos(a)*dist, -MAP+EDGE, MAP-EDGE);
     let z=clamp(S.z+Math.sin(a)*dist, -MAP+EDGE, MAP-EDGE);
-    let rot=0;
-    // после 3-й АЗС часть точек уходит в поля — приходится съезжать с дорог
-    const offroad = S.found>=3 && Math.random()<0.45;
-    if(!offroad){
-      const side=Math.random()<.5?-1:1;
-      const off=ROAD_HALF+13+Math.random()*6;      // 22…28 м от оси — обочина
-      if(Math.random()<.5){                        // дорога идёт вдоль Z
-        x=safeLine(x) + side*off;
-        rot = side>0 ? Math.PI : 0;                // мачта развёрнута к дороге
-      } else {                                     // дорога идёт вдоль X
-        z=safeLine(z) + side*off;
-        rot = side>0 ? Math.PI/2 : -Math.PI/2;
-      }
+    let rot;
+    /* Станция всегда у дороги. Раньше с 3-й АЗС почти половина точек уходила
+       в поля — станцию посреди поля не видно с дороги, и искать её было нечестно. */
+    const side=Math.random()<.5?-1:1;
+    const off=ROAD_HALF+13+Math.random()*6;        // 22…28 м от оси — обочина
+    if(Math.random()<.5){                          // дорога идёт вдоль Z
+      x=safeLine(x) + side*off;
+      rot = side>0 ? Math.PI : 0;                  // мачта развёрнута к дороге
+    } else {                                       // дорога идёт вдоль X
+      z=safeLine(z) + side*off;
+      rot = side>0 ? Math.PI/2 : -Math.PI/2;
     }
     // ни на полотне, ни на перекрёстке, ни за краем карты
     if(onPavement(x,z,ROAD_HALF+12)) continue;
