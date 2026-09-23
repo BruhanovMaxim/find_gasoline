@@ -150,6 +150,10 @@ button:hover,button:focus-visible{transform:translateY(-2px);box-shadow:0 8px 26
 @keyframes chatpulse{0%{opacity:.55;transform:scale(1)}100%{opacity:0;transform:scale(1.42)}}
 body.touch #chatlink{top:10px;right:10px;font-size:12px;padding:7px 11px}
 
+/* Виньетка объектива — бесплатный CSS-слой вместо полноэкранного прохода */
+#lens{position:fixed;inset:0;pointer-events:none;z-index:6;
+  background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,0,.28) 100%)}
+
 /* Плёнка воды на камере во время дождя */
 #wetlens{position:fixed;inset:0;pointer-events:none;z-index:7;opacity:0;
   transition:opacity .8s linear;mix-blend-mode:screen;
@@ -210,7 +214,30 @@ body.touch #chatlink{top:10px;right:10px;font-size:12px;padding:7px 11px}
 .card span{font-size:11px;line-height:1.7;color:rgba(237,230,216,.65)}
 
 /* Пауза и настройки */
-#opts{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:24px}
+#opts{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:18px}
+/* Пауза полупрозрачная: сцена видна за панелью, и эффект настроек заметен сразу.
+   Длинная панель на низком экране прокручивается: margin:auto центрирует, пока
+   есть место, и прижимает к верху, когда его нет (place-items:center обрезал бы верх). */
+#pause{place-items:stretch center;background:radial-gradient(circle at 50% 40%,rgba(12,16,22,.35),rgba(5,7,10,.72))}
+#pause>div{margin:auto 0}
+/* на паузе приборы и сенсорные кнопки прячутся: сквозь полупрозрачный фон они лезли под панель */
+body.paused #hud,body.paused #touch{visibility:hidden}
+#pause h1{font-size:clamp(30px,6vw,52px)}
+#gfx{margin:18px auto 0;padding:14px 16px;width:min(640px,100%);text-align:left;
+  display:grid;gap:7px;background:rgba(9,12,17,.82)}
+#gfx .head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
+#gfx .head span{font-size:10px;letter-spacing:.3em;color:var(--amber)}
+#gfx .head b{font-family:var(--display);font-size:13px;font-weight:600;letter-spacing:.1em;color:var(--ok)}
+#gfx .grp{margin-top:8px;padding-top:8px;border-top:1px solid var(--stroke);
+  font-size:9px;letter-spacing:.3em;color:rgba(237,230,216,.4)}
+#gfx .row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+#gfx .row>span{font-size:11px;letter-spacing:.1em;color:rgba(237,230,216,.72)}
+#gfx .seg{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+#gfx .seg button{margin:0;font-family:var(--mono);font-size:10px;letter-spacing:.08em;padding:6px 9px;
+  background:transparent;color:var(--cream);border:1px solid var(--stroke);border-radius:2px}
+#gfx .seg button:hover,#gfx .seg button:focus-visible{transform:none;box-shadow:none;border-color:var(--amber);outline:none}
+#gfx .seg button.on{background:var(--amber);color:var(--asphalt);border-color:var(--amber)}
+#gfx .note{font-size:10px;line-height:1.6;color:rgba(237,230,216,.45)}
 .opt{margin:0;font-size:12px;letter-spacing:.1em;padding:9px 16px;
   background:transparent;color:var(--cream);border:1px solid var(--stroke)}
 .opt:hover{transform:none;box-shadow:none;border-color:var(--amber);color:var(--amber)}
@@ -304,6 +331,8 @@ body.touch .hint-touch{display:inline}
 body.touch .screen h1{font-size:clamp(32px,11vw,58px)}
 body.touch #opts{gap:8px}
 body.touch .opt{font-size:11px;padding:11px 14px}
+body.touch #gfx{padding:10px 11px;gap:6px}
+body.touch #gfx .seg button{padding:8px 8px}
 </style>
 </head>
 <body>
@@ -357,6 +386,7 @@ body.touch .opt{font-size:11px;padding:11px 14px}
 <div id="wetlens"></div>
 <div id="streaks"></div>
 <div id="flare"><i class="core"></i><i class="g1"></i><i class="g2"></i><i class="g3"></i></div>
+<div id="lens"></div>
 <div id="vignette"></div>
 
 <div id="perk" class="screen hidden">
@@ -369,9 +399,8 @@ body.touch .opt{font-size:11px;padding:11px 14px}
 <div id="pause" class="screen hidden">
   <div>
     <h1>ПАУЗА</h1>
+    <div id="gfx" class="panel"></div>
     <div id="opts">
-      <button class="opt" id="o-shadow">ТЕНИ: ВКЛ</button>
-      <button class="opt" id="o-quality">КАЧЕСТВО: ВЫСОКОЕ</button>
       <button class="opt" id="o-sound">ЗВУК: ВКЛ</button>
     </div>
     <button id="resume">ПРОДОЛЖИТЬ</button>
@@ -599,8 +628,6 @@ renderer.shadowMap.type = THREE.PCFShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;   // без неё яркие места выжигаются в белое
 renderer.toneMappingExposure = 1.0;
 const MAX_ANISO = Math.min(8, renderer.capabilities.getMaxAnisotropy());
-// телефон: трава реже, без постобработки и с картой теней поменьше (см. applyQuality)
-const COARSE = matchMedia('(pointer:coarse)').matches || 'ontouchstart' in window;
 
 const scene  = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(58, 1, .5, 1600);
@@ -1886,13 +1913,13 @@ const wheels=[], headGlow=[];
     sp.scale.set(4,4,1); sp.position.set(x,y,z+.12); car.add(sp); headGlow.push(sp);
   });
 
-  // ближний свет (включается ночью)
-  const beam=(x)=>{
-    const l=new THREE.SpotLight(0xFFE9C0, 0, 95, 0.4, .6, 1.1);
-    l.position.set(x,.8,2.4); l.target.position.set(x,-.6,30);
-    car.add(l); car.add(l.target); return l;
-  };
-  car.userData.beams=[beam(-.62),beam(.62)];
+  /* Ближний свет (включается ночью) — один прожектор по центру вместо двух:
+     каждый источник считается в шейдере каждого пикселя, а на дистанции
+     в десятки метров два пятна фар всё равно сливаются в одно. */
+  const beam=new THREE.SpotLight(0xFFE9C0, 0, 95, 0.46, .6, 1.1);
+  beam.position.set(0,.8,2.4); beam.target.position.set(0,-.6,30);
+  car.add(beam); car.add(beam.target);
+  car.userData.beams=[beam];
 }
 
 /* ============================================================
@@ -2234,45 +2261,66 @@ scene.traverse(o=>{
 
 /* --- постобработка: bloom, сглаживание, плёнка ---
    Модули грузятся динамически и необязательны: если CDN с аддонами не ответит,
-   игра рисуется напрямую, как раньше, просто без свечения и виньетки. */
-let composer=null, gradePass=null;
+   игра рисуется напрямую, как раньше, просто без свечения. Виньетка — CSS-слой
+   #lens поверх канваса: отдельный полноэкранный проход ради неё стоил ~10% кадра. */
+let composer=null, bloomPass=null, smaaPass=null;
 (async()=>{
   try{
     const P='three/addons/postprocessing/';
-    const [{EffectComposer},{RenderPass},{UnrealBloomPass},{OutputPass},{ShaderPass},{SMAAPass}] = await Promise.all(
-      ['EffectComposer','RenderPass','UnrealBloomPass','OutputPass','ShaderPass','SMAAPass'].map(n=>import(P+n+'.js')));
+    const [{EffectComposer},{RenderPass},{UnrealBloomPass},{OutputPass},{SMAAPass}] = await Promise.all(
+      ['EffectComposer','RenderPass','UnrealBloomPass','OutputPass','SMAAPass'].map(n=>import(P+n+'.js')));
     /* Канвасное MSAA в цепочке постобработки теряется, а MSAA на HDR-буфере
        съедало на слабой графике четверть кадров. SMAA после тональной
        компрессии даёт почти то же сглаживание за малую долю цены. */
     const c=new EffectComposer(renderer);
     c.addPass(new RenderPass(scene, camera));
-    c.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth/2, innerHeight/2), .42, .5, .92));
+    bloomPass=new UnrealBloomPass(new THREE.Vector2(innerWidth/2, innerHeight/2), .42, .5, .92);
+    c.addPass(bloomPass);
     c.addPass(new OutputPass());
-    c.addPass(new SMAAPass());
-    /* Плёнка: виньетка, чуть заметная хроматическая аберрация к краям кадра
-       и зерно. Идёт после OutputPass — в итоговых sRGB-значениях. */
-    gradePass=new ShaderPass({
-      uniforms:{ tDiffuse:{value:null}, uTime:{value:0}, uRes:{value:new THREE.Vector2(1,1)} },
-      vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
-      fragmentShader:`uniform sampler2D tDiffuse; uniform float uTime; uniform vec2 uRes; varying vec2 vUv;
-        void main(){
-          vec2 d=vUv-0.5; float r2=dot(d,d);
-          vec2 off=d*r2*0.006;
-          vec3 c=vec3(texture2D(tDiffuse,vUv+off).r, texture2D(tDiffuse,vUv).g, texture2D(tDiffuse,vUv-off).b);
-          c*=mix(1.0, smoothstep(0.95, 0.15, r2*1.8), 0.55);
-          float n=fract(sin(dot(vUv*uRes + fract(uTime)*97.0, vec2(12.9898,78.233)))*43758.5453);
-          c+=(n-0.5)*0.028;
-          gl_FragColor=vec4(c,1.0);
-        }`
-    });
-    c.addPass(gradePass);
+    smaaPass=new SMAAPass();
+    c.addPass(smaaPass);
     composer=c;
-    resize();
+    resize(); renderGfx();
   }catch(e){ composer=null; console.warn('Постобработка недоступна, рисуем напрямую', e); }
+  warmLights();
 })();
+// цепочка постобработки нужна, если включено хоть что-то из неё
+const usePost=()=>!!composer && !!(Q.bloom||Q.aa);
 function render(){
-  if(composer && hiQuality){ gradePass.uniforms.uTime.value=clock.elapsedTime; composer.render(); }
+  if(usePost()){ bloomPass.enabled=!!Q.bloom; smaaPass.enabled=!!Q.aa; composer.render(); }
   else renderer.render(scene,camera);
+}
+
+/* --- «ночные» источники света: включены, только когда нужны ---
+   Фары, зелёная лампа и свет навеса АЗС считаются в шейдере каждого пикселя
+   каждого материала даже с нулевой яркостью — днём это съедало почти треть
+   кадра. Поэтому они выключаются (visible=false), когда не светят или далеко.
+   Но число источников входит в ключ шейдерной программы, и первое же
+   переключение пересобрало бы все шейдеры с заметным рывком. Все сочетания
+   компилируются заранее, в фоне, пока открыто меню; three хранит программы
+   по ключу, и дальше переключение бесплатно. */
+const LIGHT_SETS=[[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,1,1],[1,1,1]];
+function setLights(beams, lamp, canopy){
+  car.userData.beams.forEach(b=>b.visible=!!beams);
+  station.userData.lamp.visible=!!lamp;
+  station.userData.canopyLight.visible=!!canopy;
+}
+let lightsWarm=false;
+async function warmLights(){
+  // тональная компрессия входит в программу: для постобработки сцена рисуется
+  // в HDR-буфер без неё, напрямую — с ней. Греем тот путь, что сейчас активен
+  const target = usePost() ? composer.readBuffer : null;
+  try{
+    for(const set of LIGHT_SETS){
+      setLights(...set);
+      const prev=renderer.getRenderTarget();
+      renderer.setRenderTarget(target);
+      const done=renderer.compileAsync(scene,camera);   // сама компиляция стартует синхронно
+      renderer.setRenderTarget(prev);
+      await done;
+    }
+  }catch(e){}
+  lightsWarm=true;
 }
 
 /* ============================================================
@@ -2321,6 +2369,7 @@ function togglePause(){
   if(S.mode!=='play' && !S.paused) return;
   S.paused=!S.paused;
   document.getElementById('pause').classList.toggle('hidden',!S.paused);
+  document.body.classList.toggle('paused',S.paused);
   if(S.paused) Sfx.mute();
 }
 function toggleSound(){
@@ -2329,24 +2378,112 @@ function toggleSound(){
   const b=document.getElementById('o-sound');
   if(b) b.textContent='ЗВУК: '+(S.muted?'ВЫКЛ':'ВКЛ');
 }
-let shadowsOn=true, hiQuality=!COARSE;
+/* ---------- настройки графики ----------
+   По умолчанию всё на максимуме. Выбор игрока хранится в localStorage
+   и переживает перезагрузку; сломанная или чужая запись просто игнорируется. */
+const GFX_KEY='nb_gfx';
+const Q_MAX={res:1, auto:0, aa:1, grass:3, shadows:3, clouds:1, env:1, lights:1, bloom:1};
+const Q=Object.assign({},Q_MAX);
+try{
+  const saved=JSON.parse(localStorage.getItem(GFX_KEY)||'null');
+  if(saved && typeof saved==='object') for(const k in Q_MAX) if(typeof saved[k]==='number') Q[k]=saved[k];
+}catch(e){}
+const GFX=[
+  ['КАЧЕСТВО',[
+    ['res',    'Разрешение',           [[.5,'50%'],[.7,'70%'],[.85,'85%'],[1,'100%']]],
+    ['auto',   'Авто-разрешение',      [[0,'ВЫКЛ'],[1,'ВКЛ']]],
+    ['aa',     'Сглаживание',          [[0,'ВЫКЛ'],[1,'SMAA']]],
+    ['grass',  'Трава',                [[0,'НЕТ'],[1,'РЕДКАЯ'],[2,'СРЕДНЯЯ'],[3,'ГУСТАЯ']]]]],
+  ['ТЕНИ',[
+    ['shadows','Тени от солнца',       [[0,'ВЫКЛ'],[1,'НИЗКИЕ'],[2,'СРЕДНИЕ'],[3,'ВЫСОКИЕ']]],
+    ['clouds', 'Тени облаков',         [[0,'ВЫКЛ'],[1,'ВКЛ']]]]],
+  ['ОСВЕЩЕНИЕ',[
+    ['env',    'Свет и отражения неба',[[0,'ВЫКЛ'],[1,'ВКЛ']]],
+    ['lights', 'Свет АЗС',             [[0,'ВЫКЛ'],[1,'ВКЛ']]],
+    ['bloom',  'Свечение (bloom)',     [[0,'ВЫКЛ'],[1,'ВКЛ']]]]]
+];
+const PRESETS=[
+  ['НИЗКОЕ',  {res:.7, auto:1, aa:0, grass:0, shadows:1, clouds:0, env:0, lights:0, bloom:0}],
+  ['СРЕДНЕЕ', {res:.85,auto:1, aa:1, grass:1, shadows:2, clouds:0, env:1, lights:1, bloom:0}],
+  ['ВЫСОКОЕ', {res:1,  auto:1, aa:1, grass:2, shadows:2, clouds:1, env:1, lights:1, bloom:1}],
+  ['МАКСИМУМ',Q_MAX]
+];
+/* Динамическое разрешение (настройка «Авто-разрешение»): если кадров меньше 48,
+   внутреннее разрешение снижается шагами по 10% (до 60% от выбранного), при
+   устойчивых 57+ — возвращается. Вверх — медленнее, чем вниз, иначе на границе
+   оно бы качалось туда-сюда. Интерфейс рисуется браузером отдельно и не мылится. */
+let resScale=1, resLow=0, resHigh=0, resFrozen=false;   // resFrozen — только для замеров в #debug
+const basePR=()=>Math.min(devicePixelRatio,2)*Q.res;
+function adaptRes(f){
+  if(!Q.auto || S.mode!=='play' || S.paused || resFrozen){ resLow=resHigh=0; return; }
+  if(f<48){ resHigh=0; if(++resLow>=2 && resScale>0.6){ resScale=Math.max(0.6,resScale-0.1); resLow=0; applyRes(); } }
+  else if(f>=57){ resLow=0; if(++resHigh>=12 && resScale<1){ resScale=Math.min(1,resScale+0.1); resHigh=0; applyRes(); } }
+  else resLow=resHigh=0;
+}
+function applyRes(){ renderer.setPixelRatio(basePR()*resScale); resize(); }
+// тени: [размер карты, полуширина охвата вокруг машины, мягкость]. Чем меньше
+// карта, тем меньше охват — иначе тексель становится крупным и тень лесенкой
+const SHADOW_LVL=[null,[1024,55,1.2],[2048,75,1.8],[4096,95,2.4]];
 function applyQuality(){
-  renderer.shadowMap.enabled=shadowsOn;
-  renderer.setPixelRatio(hiQuality?Math.min(devicePixelRatio,1.75):1);
-  /* Высокое качество: постобработка, густая трава, карта теней 4096.
-     Быстрое: без постобработки, трава втрое реже, карта 2048. Карту теней
-     приходится пересоздать — three выделяет её один раз под mapSize. */
-  grass.geometry.instanceCount = hiQuality ? GRASS_MAX : Math.floor(GRASS_MAX/3);
-  const sm = hiQuality ? 4096 : 2048;
-  if(sun.shadow.mapSize.x!==sm){
-    sun.shadow.mapSize.set(sm,sm);
-    if(sun.shadow.map){ sun.shadow.map.dispose(); sun.shadow.map=null; }
+  if(!Q.auto) resScale=1;
+  renderer.setPixelRatio(basePR()*resScale);
+  /* Выключенные тени — это castShadow у солнца, а не shadowMap.enabled: число
+     теневых источников входит в ключ программы, и three сам подменит шейдеры.
+     Карту теней при смене размера приходится пересоздать — она выделяется один раз. */
+  const sh=SHADOW_LVL[Q.shadows];
+  sun.castShadow=!!sh;
+  if(sh){
+    const [size,ext,rad]=sh, c=sun.shadow.camera;
+    if(sun.shadow.mapSize.x!==size){
+      sun.shadow.mapSize.set(size,size);
+      if(sun.shadow.map){ sun.shadow.map.dispose(); sun.shadow.map=null; }
+    }
+    if(c.right!==ext){ c.left=c.bottom=-ext; c.right=c.top=ext; c.updateProjectionMatrix(); }
+    sun.shadow.radius=rad;
   }
-  scene.traverse(o=>{ if(o.material){ const m=o.material;
-    (Array.isArray(m)?m:[m]).forEach(x=>x.needsUpdate=true); } });
-  const a=document.getElementById('o-shadow'), b=document.getElementById('o-quality');
-  if(a) a.textContent='ТЕНИ: '+(shadowsOn?'ВКЛ':'ВЫКЛ');
-  if(b) b.textContent='КАЧЕСТВО: '+(hiQuality?'ВЫСОКОЕ':'БЫСТРОЕ');
+  grass.visible=Q.grass>0;
+  grass.geometry.instanceCount=Math.round(GRASS_MAX*[0,.34,.67,1][Q.grass]);
+  // без карты окружения материалы берут рассеянный свет только от полусферы (см. tick)
+  if(!Q.env) scene.environment=null; else envKey='';
+  try{ localStorage.setItem(GFX_KEY, JSON.stringify(Q)); }catch(e){}
+  renderGfx();
+}
+function setGfx(patch){
+  Object.assign(Q,patch);
+  applyQuality(); resize();
+  // сменился путь рендера или набор теней/окружения — догреваем новые варианты шейдеров
+  warmLights();
+}
+function buildGfx(){
+  const box=$('gfx'); if(!box) return;
+  let h='<div class="head"><span>НАСТРОЙКИ ГРАФИКИ</span><b id="gfx-fps">— FPS</b></div>';
+  h+='<div class="row"><span>Пресет</span><div class="seg">'+
+    PRESETS.map(([t],i)=>'<button data-p="'+i+'">'+t+'</button>').join('')+'</div></div>';
+  for(const [g,rows] of GFX){
+    h+='<div class="grp">'+g+'</div>';
+    for(const [k,t,vals] of rows)
+      h+='<div class="row"><span>'+t+'</span><div class="seg">'+
+        vals.map(([v,l])=>'<button data-k="'+k+'" data-v="'+v+'">'+l+'</button>').join('')+'</div></div>';
+  }
+  h+='<div class="note" id="gfx-note"></div>';
+  box.innerHTML=h;
+  box.addEventListener('click',e=>{
+    const b=e.target.closest('button'); if(!b) return;
+    if(b.dataset.p!==undefined) setGfx(PRESETS[+b.dataset.p][1]);
+    else setGfx({[b.dataset.k]:+b.dataset.v});
+  });
+}
+function renderGfx(){
+  const box=$('gfx'); if(!box) return;
+  box.querySelectorAll('button[data-k]').forEach(b=>b.classList.toggle('on', Q[b.dataset.k]===+b.dataset.v));
+  box.querySelectorAll('button[data-p]').forEach(b=>{
+    const p=PRESETS[+b.dataset.p][1];
+    b.classList.toggle('on', Object.keys(Q_MAX).every(k=>p[k]===Q[k]));
+  });
+  const note=$('gfx-note');
+  if(note) note.textContent = !composer && (Q.bloom||Q.aa)
+    ? 'Модули постобработки не загрузились — свечение и SMAA недоступны, работает встроенное сглаживание.'
+    : Q.auto ? 'Авто-разрешение снижает резкость, когда кадров меньше 48, и возвращает её при запасе.' : '';
 }
 
 /* --- сенсорное управление --- */
@@ -2490,7 +2627,7 @@ function reset(){
   S.eco=1; S.lockR=LOCK; S.kits=0; S.stBonus=0; S.gripBonus=0; S.spd=1; S.canCount=2;
   S.perks={};
   S.dist=0; S.bestDrift=0; S.maxCombo=1; S.trail.length=0; S.trailT=0;
-  S.paused=false; S.tut=0; S.clock=0; S.dayPhase='';
+  S.paused=false; S.tut=0; S.clock=0; S.dayPhase=''; document.body.classList.remove('paused');
   S.prevSpeed=0; S.pitchD=0; S.rollD=0;
   input.f=input.b=input.l=input.r=input.hand=0; input.tsteer=0;
   barriers.count=0;
@@ -2884,7 +3021,8 @@ function tick(){
 
   // счётчик кадров
   fpsAcc+=dt; fpsFrames++;
-  if(fpsAcc>0.5){ fps=Math.round(fpsFrames/fpsAcc); fpsAcc=0; fpsFrames=0; el.fps.textContent=fps; }
+  if(fpsAcc>0.5){ fps=Math.round(fpsFrames/fpsAcc); fpsAcc=0; fpsFrames=0; el.fps.textContent=fps; adaptRes(fps);
+    if(S.paused){ const f=$('gfx-fps'); if(f) f.textContent=fps+' FPS'; } }
 
   if(S.paused){ render(); return; }
 
@@ -3082,6 +3220,13 @@ function tick(){
     (0.10+Math.sin(t*2.2)*0.03+S.night*0.07) * clamp((820-stD)/320,0,1);
   station.userData.lamp.intensity=50+Math.sin(t*3)*14+S.night*90;
   station.userData.canopyLight.intensity=Math.max(S.night,S.rain*0.6)*140;
+  if(lightsWarm){
+    // фары в темноте горят всегда; настройка «Свет АЗС» гасит только станцию.
+    // Лампа добивает на 90 м, навес — на 26: дальше их свет всё равно не виден
+    const nearSt=!!Q.lights && (stationPos.x-camera.position.x)**2+(stationPos.z-camera.position.z)**2 < 160*160;
+    setLights(Math.max(S.night,S.rain*0.7)>0.02, nearSt,
+              nearSt && station.userData.canopyLight.intensity>1);
+  }
   station.userData.panelMat.emissiveIntensity=1.2+S.night*5;
   grass.userData.uni.uStation.value.set(stationPos.x, stationPos.z);
   cans.forEach(k=>{ if(!k.taken){ k.mesh.rotation.y=t*1.6; k.mesh.position.y=heightAt(k.mesh.position.x,k.mesh.position.z)+.75+Math.sin(t*2+k.mesh.id)*0.12; }});
@@ -3134,7 +3279,8 @@ function tick(){
   /* Днём рассеянный свет даёт карта окружения, полусфера — лишь отражённый
      от травы подсвет. Ночью небо почти чёрное, и читаемость земли держит она.
      В дождь небо серое и светлое — окружение само даёт пасмурный рассеянный свет. */
-  hemi.intensity=lerp(0.3,0.85,gloom)+S.rain*0.12*(1-S.night);
+  // без карты окружения рассеянный свет неба целиком ложится на полусферу
+  hemi.intensity=lerp(Q.env?0.3:0.8,0.85,gloom)+S.rain*0.12*(1-S.night);
   palette(hemi.color,'amb',gloom,dusk);
   starMat.opacity=S.night*(1-S.rain)*0.9;
   /* Мерцание: две синусоиды несовпадающих периодов, поэтому рисунок не повторяется
@@ -3151,11 +3297,11 @@ function tick(){
     }
     starGeo.attributes.color.needsUpdate=true;
   }
-  car.userData.beams.forEach(b=>b.intensity=Math.max(S.night,S.rain*0.7)*200);
+  car.userData.beams.forEach(b=>b.intensity=Math.max(S.night,S.rain*0.7)*360);
   lampEmissive=Math.max(S.night,S.rain*0.8);
   /* Плафоны, окна и фары светятся ярче единицы — их ловит bloom. Ореолы-спрайты
      остались для режима без постобработки, с ней они приглушены. */
-  const post = composer && hiQuality ? 0.45 : 1;
+  const post = usePost() && Q.bloom ? 0.45 : 1;
   const lights = Math.max(S.night,S.rain*0.7);
   if(lampMat) lampMat.emissive.setRGB(lampEmissive*4.2, lampEmissive*3.4, lampEmissive*1.9);
   // окна теплее и слабее уличных плафонов — свет из комнаты, а не фонарь
@@ -3198,11 +3344,11 @@ function tick(){
   U.uSunDir.value.copy(sunDir);
   U.uScatter.value.copy(sun.color).multiplyScalar(glow*0.45);
   U.uCloudOff.value.set(t*0.0011, t*0.0004);
-  U.uCloudShadow.value=0.4*glow*(1-S.rain);
+  U.uCloudShadow.value=Q.clouds ? 0.4*glow*(1-S.rain) : 0;
   /* Карта окружения — пересчёт, только когда небо заметно сдвинулось:
      полный прогон PMREM на каждом кадре был бы дорог, а небо меняется медленно. */
   const envSig=Math.round(sunDir.x*20)+","+Math.round(sunDir.z*20)+","+Math.round(gloom*25)+","+Math.round(dusk*20)+","+Math.round(S.rain*10);
-  if(envSig!==envKey){ envKey=envSig; updateEnv(); }
+  if(Q.env && envSig!==envKey){ envKey=envSig; updateEnv(); }
   {
     const day=(1-S.night)*(1-S.rain*0.85);
     let vis=0, sx=0, sy=0;
@@ -3217,7 +3363,7 @@ function tick(){
       }
     }
     // с постобработкой солнце и так даёт ореол через bloom — экранный блик слабее
-    flare.el.style.opacity=(vis*(composer&&hiQuality?0.55:1)).toFixed(3);
+    flare.el.style.opacity=(vis*(usePost()&&Q.bloom?0.55:1)).toFixed(3);
     if(vis>0.01){
       const cx=innerWidth/2, cy=innerHeight/2;
       flare.parts.forEach((p,i)=>{
@@ -3496,20 +3642,16 @@ function resize(){
   const w=innerWidth,h=innerHeight;
   renderer.setSize(w,h,false);
   camera.aspect=w/h; camera.updateProjectionMatrix();
-  if(composer){
-    composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(w,h);
-    gradePass.uniforms.uRes.value.set(w*renderer.getPixelRatio(), h*renderer.getPixelRatio());
-  }
+  if(composer){ composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(w,h); }
 }
 addEventListener('resize',resize); resize();
 
 $('start').addEventListener('click',()=>{ Sfx.init(); reset(); });
 $('again').addEventListener('click',()=>{ reset(); });
 $('resume').addEventListener('click',()=>togglePause());
-$('o-shadow').addEventListener('click',()=>{ shadowsOn=!shadowsOn; applyQuality(); });
-$('o-quality').addEventListener('click',()=>{ hiQuality=!hiQuality; applyQuality(); resize(); });
 $('o-sound').addEventListener('click',()=>toggleSound());
 initTouch();
+buildGfx();
 applyQuality();
 
 placeStation(); placeCans();
@@ -3517,7 +3659,7 @@ car.position.set(S.x,heightAt(S.x,S.z),S.z);
 camPos.set(0,10,-16);
 // отладочный доступ к состоянию — только по адресу с #debug (скриншоты, подбор света)
 if(location.hash==="#debug") window.__nb={S, scene, renderer, camera, grass, sun, chunkList, traffic,
-  get composer(){ return composer; }, set cam(v){ debugCam=v; }, car, heightAt, stationPos, setHi(v){ hiQuality=v; applyQuality(); resize(); }};
+  get composer(){ return composer; }, get resScale(){ return resScale; }, set res(v){ resFrozen=true; resScale=v; applyRes(); }, get lightsWarm(){ return lightsWarm; }, set cam(v){ debugCam=v; }, car, heightAt, stationPos, Q, set q(v){ setGfx(v); }};
 tick();
 </script>
 </body>
