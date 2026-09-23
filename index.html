@@ -10,7 +10,7 @@
    ============================================================ */
 :root{
   --asphalt:#0B0E12;
-  --panel:rgba(9,12,17,.68);
+  --panel:rgba(9,12,17,.8);
   --stroke:rgba(237,230,216,.14);
   --amber:#FFB020;
   --amber-dim:#6B4711;
@@ -29,8 +29,9 @@ html,body{height:100%;overflow:hidden;background:var(--asphalt);color:var(--crea
 
 /* ---------- HUD ---------- */
 #hud{position:fixed;inset:0;pointer-events:none;z-index:10}
-.panel{background:var(--panel);border:1px solid var(--stroke);border-radius:3px;
-  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+/* Без backdrop-filter: размытие того, что под панелью, пересчитывалось каждый
+   кадр для каждой панели — сцена под ними меняется постоянно. Фон плотнее вместо него. */
+.panel{background:var(--panel);border:1px solid var(--stroke);border-radius:3px}
 
 /* Статистика — левый верх */
 #stats{position:absolute;top:14px;left:14px;padding:10px 12px;display:grid;gap:6px;
@@ -173,8 +174,9 @@ body.touch #chatlink{top:10px;right:10px;font-size:12px;padding:7px 11px}
 
 /* Солнечные блики (экранный слой, без постобработки) */
 #flare{position:fixed;inset:0;pointer-events:none;z-index:8;overflow:hidden;opacity:0}
-#flare i{position:absolute;display:block;border-radius:50%;transform:translate(-50%,-50%);
-  mix-blend-mode:screen;will-change:left,top}
+/* Положение задаётся через transform из tick(): left/top пересчитывали раскладку каждый кадр */
+#flare i{position:absolute;left:0;top:0;display:block;border-radius:50%;transform:translate(-50%,-50%);
+  mix-blend-mode:screen;will-change:transform}
 #flare .core{width:460px;height:460px;background:radial-gradient(circle,
   rgba(255,250,232,.95) 0%,rgba(255,222,158,.42) 18%,rgba(255,186,88,.14) 42%,transparent 68%)}
 #flare .g1{width:150px;height:150px;background:radial-gradient(circle,rgba(255,196,110,.30),transparent 68%)}
@@ -642,7 +644,10 @@ const Sfx = {
    3. СЦЕНА, СВЕТ, НЕБО
    ============================================================ */
 const canvas   = document.getElementById('scene');
-const renderer = new THREE.WebGLRenderer({canvas, antialias:true, powerPreference:'high-performance'});
+/* antialias:false — сглаживание делает SMAA в постобработке. Мультисэмплинг
+   экранного буфера при ней только тратил память и полосу на полноэкранный
+   резолв каждый кадр, а при выключенном сглаживании включал его обратно. */
+const renderer = new THREE.WebGLRenderer({canvas, antialias:false, powerPreference:'high-performance'});
 renderer.setPixelRatio(Math.min(devicePixelRatio,1.75));
 renderer.shadowMap.enabled = true;
 /* PCFSoftShadowMap в r185 объявлен устаревшим и молча подменяется на PCF.
@@ -1019,7 +1024,13 @@ const sky = new THREE.Mesh(
       }`
   })
 );
-sky.frustumCulled = false; scene.add(sky);
+sky.frustumCulled = false;
+/* Непрозрачные three сортирует прежде всего по id материала, а материал неба
+   создан первым — поэтому небо рисовалось раньше всех, и его шейдер с двумя
+   fbm облаков считался для КАЖДОГО пикселя экрана, включая закрытые землёй.
+   Последним среди непрозрачных оно отсекается тестом глубины ещё до шейдера. */
+sky.renderOrder = 1000;
+scene.add(sky);
 
 /* Карта окружения — то же небо, прогнанное через PMREM. Она даёт металлу и лаку
    отражения, а всем остальным — рассеянный свет неба с правильной стороны.
@@ -1027,14 +1038,21 @@ sky.frustumCulled = false; scene.add(sky);
 const pmrem = new THREE.PMREMGenerator(renderer);
 const envScene = new THREE.Scene();
 envScene.add(new THREE.Mesh(new THREE.SphereGeometry(50,32,16), sky.material));
+/* fromScene() на каждый вызов заводит новый рендер-таргет, а старый приходилось
+   освобождать — выделение и сброс видеопамяти раз в пару секунд давали рывок.
+   Теперь небо снимается своей кубической камерой в постоянный куб, а PMREM
+   пишет результат в тот же самый таргет, что и в прошлый раз. */
+const envCubeRT=new THREE.WebGLCubeRenderTarget(128, {type:THREE.HalfFloatType, generateMipmaps:false});
+envCubeRT.texture.colorSpace=THREE.LinearSRGBColorSpace;
+const envCam=new THREE.CubeCamera(0.1, 100, envCubeRT);
+envScene.add(envCam);
 let envRT=null;
 function updateEnv(){
   sky.material.uniforms.isEnv.value=1;
-  const rt=pmrem.fromScene(envScene, 0, 0.1, 100, {size:128});
+  envCam.update(renderer, envScene);
   sky.material.uniforms.isEnv.value=0;
-  scene.environment=rt.texture;
-  if(envRT) envRT.dispose();
-  envRT=rt;
+  envRT=pmrem.fromCubemap(envCubeRT.texture, envRT);
+  scene.environment=envRT.texture;
 }
 
 // звёзды (проявляются ночью)
@@ -1398,7 +1416,9 @@ const grass=(()=>{
       nbS *= clamp(nbPatch, 0.3, 1.0);
       float nbA = aRnd.x*6.2832, ca = cos(nbA), sa = sin(nbA);
       vec3 nbP = position;
-      nbP.xz = vec2(ca*nbP.x - sa*nbP.z, sa*nbP.x + ca*nbP.z) * (0.7 + nbS*0.6);
+      // пучок нулевой высоты (дорога, АЗС, край поля) раньше ложился плашмя и всё
+      // равно растеризовался; теперь схлопывается в точку и не даёт ни одного пикселя
+      nbP.xz = vec2(ca*nbP.x - sa*nbP.z, sa*nbP.x + ca*nbP.z) * (0.7 + nbS*0.6) * step(0.02, nbS);
       nbP.y *= nbS;
       float nbWind = sin(uTime*1.6 + nbC.x*0.12 + nbC.y*0.09)*0.6 + sin(uTime*2.9 + nbC.x*0.5)*0.22;
       float nbBend = position.y*position.y*nbS;
@@ -2437,16 +2457,27 @@ const PRESETS=[
   ['ВЫСОКОЕ', {res:1,  auto:1, aa:1, grass:2, shadows:2, clouds:1, env:1, lights:1, bloom:1}],
   ['МАКСИМУМ',Q_MAX]
 ];
-/* Динамическое разрешение (настройка «Авто-разрешение»): если кадров меньше 48,
-   внутреннее разрешение снижается шагами по 10% (до 60% от выбранного), при
-   устойчивых 57+ — возвращается. Вверх — медленнее, чем вниз, иначе на границе
-   оно бы качалось туда-сюда. Интерфейс рисуется браузером отдельно и не мылится. */
+/* Динамическое разрешение (настройка «Авто-разрешение»): если кадров меньше 90%
+   от частоты экрана, внутреннее разрешение снижается шагами по 10% (до 60% от
+   выбранного), при устойчивых 97% — возвращается. Раньше пороги были зашиты
+   под 60 Гц и снижали только ниже 48 — а 50–55 кадров на 60-герцовом экране
+   уже заметно дёргаются, и игра могла сидеть в этой полосе сколько угодно.
+   Вверх — медленнее, чем вниз, иначе на границе оно бы качалось туда-сюда;
+   если поднятое разрешение сразу не потянуло, следующая попытка откладывается
+   вдвое дольше. Цель ограничена 120 кадрами: гнаться за 240 Гц ценой мыла незачем.
+   Интерфейс рисуется браузером отдельно и не мылится. */
 let resScale=1, resLow=0, resHigh=0, resFrozen=false;   // resFrozen — только для замеров в #debug
+let resUpNeed=12, resUpAt=-1e9;
+let screenHz=60;                                        // частота экрана, меряется в tick()
 const basePR=()=>Math.min(devicePixelRatio,2)*Q.res;
 function adaptRes(f){
   if(!Q.auto || S.mode!=='play' || S.paused || resFrozen){ resLow=resHigh=0; return; }
-  if(f<48){ resHigh=0; if(++resLow>=2 && resScale>0.6){ resScale=Math.max(0.6,resScale-0.1); resLow=0; applyRes(); } }
-  else if(f>=57){ resLow=0; if(++resHigh>=12 && resScale<1){ resScale=Math.min(1,resScale+0.1); resHigh=0; applyRes(); } }
+  const goal=Math.min(screenHz,120), now=performance.now();
+  if(f<goal*0.9){ resHigh=0; if(++resLow>=2 && resScale>0.6){
+      if(now-resUpAt<5000) resUpNeed=Math.min(resUpNeed*2,120);
+      resScale=Math.max(0.6,resScale-0.1); resLow=0; applyRes(); } }
+  else if(f>=goal*0.97){ resLow=0; if(++resHigh>=resUpNeed && resScale<1){
+      resScale=Math.min(1,resScale+0.1); resHigh=0; resUpAt=now; applyRes(); } }
   else resLow=resHigh=0;
 }
 function applyRes(){ renderer.setPixelRatio(basePR()*resScale); resize(); }
@@ -2511,8 +2542,8 @@ function renderGfx(){
   });
   const note=$('gfx-note');
   if(note) note.textContent = !composer && (Q.bloom||Q.aa)
-    ? 'Модули постобработки не загрузились — свечение и SMAA недоступны, работает встроенное сглаживание.'
-    : Q.auto ? 'Авто-разрешение снижает резкость, когда кадров меньше 48, и возвращает её при запасе.' : '';
+    ? 'Модули постобработки не загрузились — свечение и SMAA недоступны.'
+    : Q.auto ? 'Авто-разрешение снижает резкость, когда кадров заметно меньше частоты экрана, и возвращает её при запасе.' : '';
 }
 
 /* --- сенсорное управление --- */
@@ -3066,7 +3097,6 @@ function drawMinimap(){
 /* ============================================================
    10. ЦИКЛ
    ============================================================ */
-const clock=new THREE.Clock();
 const camPos=new THREE.Vector3(0,8,-14), camAim=new THREE.Vector3();
 const sunDir=new THREE.Vector3(), camFwd=new THREE.Vector3(), sunScreen=new THREE.Vector3();
 /* Рабочие объекты кадра. Раньше на каждый кадр создавались три Vector3 и один
@@ -3080,15 +3110,35 @@ let debugCam=null;             // только для #debug: ручная ка�
 let lampEmissive=0, fpsAcc=0, fpsFrames=0, fps=60, envKey="";
 const CULL_R2=(VIEW+CH*0.8)**2;
 
-function tick(){
-  requestAnimationFrame(tick);
-  const dt=Math.min(clock.getDelta(),0.05);
-  const t=clock.elapsedTime;
+/* Частота экрана. requestAnimationFrame приходит ровно раз за обновление
+   монитора, поэтому FPS выше его частоты не бывает — это не ограничение игры,
+   а вертикальная синхронизация браузера. Частоту берём по быстрым кадрам
+   (20-й процентиль интервалов): даже когда часть кадров не успевает, остальные
+   идут с шагом развёртки. */
+const frameMs=new Float32Array(120), frameSorted=new Float32Array(120);
+let frameI=0, frameN=0, lastNow=-1;
+function measureHz(){
+  if(frameN<30) return screenHz;
+  const a=frameSorted.subarray(0,frameN); a.set(frameMs.subarray(0,frameN)); a.sort();
+  const p=a[Math.floor(frameN*0.2)];
+  return p>0 ? Math.round(1000/p) : screenHz;
+}
 
-  // счётчик кадров
-  fpsAcc+=dt; fpsFrames++;
-  if(fpsAcc>0.5){ fps=Math.round(fpsFrames/fpsAcc); fpsAcc=0; fpsFrames=0; el.fps.textContent=fps; adaptRes(fps);
-    if(S.paused){ const f=$('gfx-fps'); if(f) f.textContent=fps+' FPS'; } }
+function tick(now){
+  requestAnimationFrame(tick);
+  /* Время кадра — из метки requestAnimationFrame: она выровнена по развёртке
+     экрана, и шаг получается ровным. clock.getDelta() мерил момент, когда до JS
+     дошла очередь, и дрожание в пару миллисекунд давало микрорывки движения. */
+  const raw = lastNow<0 ? 1000/60 : now-lastNow; lastNow=now;
+  const dt=Math.min(raw/1000,0.05);
+  const t=now/1000;
+
+  // счётчик кадров — по настоящим интервалам: зажатый dt завышал FPS на тяжёлых кадрах
+  fpsAcc+=raw; fpsFrames++;
+  frameMs[frameI]=raw; frameI=(frameI+1)%frameMs.length; if(frameN<frameMs.length) frameN++;
+  if(fpsAcc>500){ fps=Math.round(fpsFrames*1000/fpsAcc); fpsAcc=0; fpsFrames=0; el.fps.textContent=fps;
+    screenHz=measureHz(); adaptRes(fps);
+    if(S.paused){ const f=$('gfx-fps'); if(f) f.textContent=fps+' FPS · ЭКРАН '+screenHz+' ГЦ'; } }
 
   if(S.paused){ render(); return; }
 
@@ -3313,7 +3363,7 @@ function tick(){
       spawnDust(sx, heightAt(sx,sz), sz, .76,.87,.94, .55, .22);
     }
   }
-  wetLens.style.opacity=(S.rain*0.85).toFixed(2);
+  hudStyle(wetLens,'opacity','wetlens',(S.rain*0.85).toFixed(2));
   U.uWet.value=S.rain;
   // мокрый асфальт и трава темнеют
   wetMats.forEach(w=>w.mat.color.copy(w.base).multiplyScalar(1-S.rain*0.34));
@@ -3413,7 +3463,8 @@ function tick(){
   U.uCloudShadow.value=Q.clouds ? 0.4*glow*(1-S.rain) : 0;
   /* Карта окружения — пересчёт, только когда небо заметно сдвинулось:
      полный прогон PMREM на каждом кадре был бы дорог, а небо меняется медленно. */
-  const envSig=Math.round(sunDir.x*20)+","+Math.round(sunDir.z*20)+","+Math.round(gloom*25)+","+Math.round(dusk*20)+","+Math.round(S.rain*10);
+  // шаг по направлению солнца ~6° — в размытых отражениях разница не видна, а пересчётов вдвое меньше
+  const envSig=Math.round(sunDir.x*10)+","+Math.round(sunDir.z*10)+","+Math.round(gloom*25)+","+Math.round(dusk*20)+","+Math.round(S.rain*10);
   if(Q.env && envSig!==envKey){ envKey=envSig; updateEnv(); }
   {
     const day=(1-S.night)*(1-S.rain*0.85);
@@ -3429,13 +3480,13 @@ function tick(){
       }
     }
     // с постобработкой солнце и так даёт ореол через bloom — экранный блик слабее
-    flare.el.style.opacity=(vis*(usePost()&&Q.bloom?0.55:1)).toFixed(3);
+    // стиль пишется только при изменении: каждая запись — пересчёт стилей в браузере
+    hudStyle(flare.el,'opacity','flare',(vis*(usePost()&&Q.bloom?0.55:1)).toFixed(3));
     if(vis>0.01){
       const cx=innerWidth/2, cy=innerHeight/2;
       flare.parts.forEach((p,i)=>{
         const k=flare.k[i];
-        p.style.left=(cx+(sx-cx)*k)+'px';
-        p.style.top =(cy+(sy-cy)*k)+'px';
+        p.style.transform=`translate3d(${(cx+(sx-cx)*k).toFixed(1)}px,${(cy+(sy-cy)*k).toFixed(1)}px,0) translate(-50%,-50%)`;
       });
     }
   }
@@ -3725,8 +3776,9 @@ car.position.set(S.x,heightAt(S.x,S.z),S.z);
 camPos.set(0,10,-16);
 // отладочный доступ к состоянию — только по адресу с #debug (скриншоты, подбор света)
 if(location.hash==="#debug") window.__nb={S, scene, renderer, camera, grass, sun, chunkList, traffic,
-  get composer(){ return composer; }, get resScale(){ return resScale; }, set res(v){ resFrozen=true; resScale=v; applyRes(); }, get lightsWarm(){ return lightsWarm; }, set cam(v){ debugCam=v; }, car, heightAt, stationPos, Q, set q(v){ setGfx(v); }};
-tick();
+  get composer(){ return composer; }, get resScale(){ return resScale; }, set res(v){ resFrozen=true; resScale=v; applyRes(); }, get lightsWarm(){ return lightsWarm; }, set cam(v){ debugCam=v; }, car, heightAt, stationPos, Q, set q(v){ setGfx(v); },
+  get fps(){ return fps; }, get hz(){ return screenHz; }};
+requestAnimationFrame(tick);
 </script>
 </body>
 </html>
